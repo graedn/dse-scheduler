@@ -131,6 +131,13 @@ class Database:
         )
         self.conn.commit()
 
+    def get_matches_by_teamup_event_id(self, event_id: str) -> list[dict]:
+        """Get all matches associated with a given TeamUp event ID."""
+        rows = self.conn.execute(
+            "SELECT * FROM matches WHERE teamup_event_id = ?", (event_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- Teams ---
 
     def get_team(self, name: str) -> Optional[dict]:

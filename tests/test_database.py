@@ -191,6 +191,18 @@ def test_get_all_blocked_days_ordered(db):
     assert days[1]["date"] == "2024-05-03"
 
 
+def test_get_matches_by_teamup_event_id(db):
+    mid = db.insert_match("Premier", "Week 1", "Team A", "Team B", 1700000000, 1699990000)
+    db.update_match_teamup_id(mid, "tu-event-xyz")
+    results = db.get_matches_by_teamup_event_id("tu-event-xyz")
+    assert len(results) == 1
+    assert results[0]["id"] == mid
+
+def test_get_matches_by_teamup_event_id_no_match(db):
+    results = db.get_matches_by_teamup_event_id("nonexistent")
+    assert results == []
+
+
 # --- Reset ---
 
 def test_reset_all_clears_everything(db):

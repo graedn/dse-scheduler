@@ -158,11 +158,21 @@ def build_proposal_message(date_str: str, current_combo: list[dict],
 
 async def accept_combination(combo: list[dict], date_str: str, db, teamup,
                               broadcast_channel) -> None:
-    """Post a combination to TeamUp and notify the broadcast channel."""
+    """Post a combination to TeamUp and notify the broadcast channel.
+
+    Creates all TeamUp events before writing any DB updates so a partial
+    TeamUp failure does not leave the DB in an inconsistent state.
+    """
+    # Phase 1: create all TeamUp events (may raise TeamUpError — no DB writes yet)
+    created: list[tuple[dict, str]] = []
     for match in combo:
         title = f"[{match['division']}] {match['team_home']} vs {match['team_away']}"
         end_ts = match["match_time"] + int(MATCH_DURATION_H * 3600)
         event_id = teamup.create_event(title, match["match_time"], end_ts)
+        created.append((match, event_id))
+
+    # Phase 2: all events created — now write DB updates
+    for match, event_id in created:
         db.update_match_teamup_id(match["id"], event_id)
         db.increment_scheduled_count(match["team_home"])
         db.increment_scheduled_count(match["team_away"])
@@ -210,14 +220,10 @@ async def process_expired_changes(db, teamup, broadcast_channel) -> None:
                 teamup.delete_event(event_id)
             except Exception:
                 pass
-            rows = db.conn.execute(
-                "SELECT * FROM matches WHERE teamup_event_id = ?", (event_id,)
-            ).fetchall()
-            for row in rows:
-                db.update_match_teamup_id(row["id"], None)
-                db.decrement_scheduled_count(row["team_home"])
-                db.decrement_scheduled_count(row["team_away"])
-            db.conn.commit()
+            for match in db.get_matches_by_teamup_event_id(event_id):
+                db.update_match_teamup_id(match["id"], None)
+                db.decrement_scheduled_count(match["team_home"])
+                db.decrement_scheduled_count(match["team_away"])
 
         # Accept new combination
         new_matches = [db.get_match(mid) for mid in new_match_ids]

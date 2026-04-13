@@ -194,3 +194,16 @@ def test_best_combination_tiebreak_by_team_counts():
     best = best_combination(matches, db)
     # Both matches are in the best 2-match combo
     assert combo_match_ids(best) == [1, 2]
+
+
+def test_build_proposal_message_contains_key_fields():
+    db = make_db({"Team A": (0, 1), "Team B": (0, 2)})
+    current = [make_match(TS_WD_8PM, 1, home="Team A", away="Team B")]
+    proposed = [make_match(TS_WD_7PM, 2, home="Team A", away="Team B"),
+                make_match(TS_WD_9PM, 3, home="Team A", away="Team B")]
+    msg = build_proposal_message("2024-04-16", current, proposed, 100, 110, db)
+    assert "Broadcast Schedule Proposal" in msg
+    assert "Current schedule" in msg
+    assert "Proposed schedule" in msg
+    assert "Auto-approves in 12 hours" in msg
+    assert "Team A" in msg
