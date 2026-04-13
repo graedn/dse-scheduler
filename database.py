@@ -4,6 +4,9 @@ import time
 from typing import Optional
 
 
+AUTO_APPROVE_SECONDS = 43200  # 12 hours
+
+
 class Database:
     def __init__(self, db_path: str = "bot.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -48,8 +51,18 @@ class Database:
                 reason TEXT,
                 teamup_event_id TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_matches_match_time ON matches (match_time);
         """)
         self.conn.commit()
+
+    def _et_day_range(self, date_str: str) -> tuple[int, int]:
+        """Return (start_ts, end_ts) Unix seconds for date_str in Eastern Time."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ET)
+        day_end = day_start.replace(hour=23, minute=59, second=59)
+        return int(day_start.timestamp()), int(day_end.timestamp())
 
     # --- Config ---
 
@@ -89,28 +102,20 @@ class Database:
 
     def get_matches_for_date(self, date_str: str) -> list[dict]:
         """All matches whose match_time falls on date_str (YYYY-MM-DD) in ET."""
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        ET = ZoneInfo("America/New_York")
-        day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ET)
-        day_end = day_start.replace(hour=23, minute=59, second=59)
+        start_ts, end_ts = self._et_day_range(date_str)
         rows = self.conn.execute(
             "SELECT * FROM matches WHERE match_time >= ? AND match_time <= ?",
-            (int(day_start.timestamp()), int(day_end.timestamp()))
+            (start_ts, end_ts)
         ).fetchall()
         return [dict(r) for r in rows]
 
     def get_scheduled_matches_for_date(self, date_str: str) -> list[dict]:
-        """Matches on date_str that have a TeamUp event ID (i.e., on the calendar)."""
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        ET = ZoneInfo("America/New_York")
-        day_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ET)
-        day_end = day_start.replace(hour=23, minute=59, second=59)
+        """Matches on date_str with a TeamUp event ID (i.e., on the calendar)."""
+        start_ts, end_ts = self._et_day_range(date_str)
         rows = self.conn.execute(
             "SELECT * FROM matches WHERE match_time >= ? AND match_time <= ? "
             "AND teamup_event_id IS NOT NULL",
-            (int(day_start.timestamp()), int(day_end.timestamp()))
+            (start_ts, end_ts)
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -135,7 +140,7 @@ class Database:
         return dict(row) if row else None
 
     def get_all_teams(self) -> list[dict]:
-        rows = self.conn.execute("SELECT * FROM teams").fetchall()
+        rows = self.conn.execute("SELECT * FROM teams ORDER BY name").fetchall()
         return [dict(r) for r in rows]
 
     def upsert_team(self, name: str):
@@ -192,7 +197,7 @@ class Database:
             "INSERT INTO pending_changes "
             "(proposed_at, auto_approve_at, description, old_event_ids, new_match_ids, discord_message_id) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (now, now + 43200, description,
+            (now, now + AUTO_APPROVE_SECONDS, description,
              json.dumps(old_event_ids), json.dumps(new_match_ids), discord_message_id)
         )
         self.conn.commit()

@@ -94,6 +94,20 @@ def test_increment_broadcast_count(db):
     assert db.get_team("Alpha Squad")["broadcast_count"] == 1
 
 
+def test_decrement_scheduled_count(db):
+    db.upsert_team("Alpha Squad")
+    db.increment_scheduled_count("Alpha Squad")
+    db.increment_scheduled_count("Alpha Squad")
+    db.decrement_scheduled_count("Alpha Squad")
+    assert db.get_team("Alpha Squad")["scheduled_count"] == 1
+
+
+def test_decrement_scheduled_count_floor_at_zero(db):
+    db.upsert_team("Alpha Squad")
+    db.decrement_scheduled_count("Alpha Squad")  # Already 0
+    assert db.get_team("Alpha Squad")["scheduled_count"] == 0
+
+
 def test_add_team_alias(db):
     db.upsert_team("Alpha Squad")
     db.add_team_alias("Alpha Squad", "alpha squad")
