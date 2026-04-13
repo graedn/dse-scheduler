@@ -159,3 +159,11 @@ def test_parse_post_invalid_division_raises():
     post = "Division: Zzzzzzz\nWeek: 3\nTeam A vs Team B\nTime: <t:1713387600:F>"
     with pytest.raises(ParseError):
         parse_post(post, db)
+
+
+def test_parse_teams_same_team_raises():
+    db = make_db_with_teams({})
+    # Both sides resolve to the same team
+    post = "Division: Premier\nWeek: 1\nAlpha Squad vs Alpha Squad\nTime: <t:123:F>"
+    with pytest.raises(ParseError):
+        parse_post(post, db)

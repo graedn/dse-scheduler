@@ -2,7 +2,6 @@ import re
 import difflib
 import json
 from dataclasses import dataclass
-from typing import Optional
 
 KNOWN_DIVISIONS = ["Premier", "Division 1", "Division 2", "Division 3", "Division 4"]
 FUZZY_THRESHOLD = 0.8
@@ -37,11 +36,16 @@ def parse_division(text: str) -> str:
         m = re.match(r"division\s*:\s*(.+)", line.strip(), re.IGNORECASE)
         if m:
             raw = m.group(1).strip()
-            matches = difflib.get_close_matches(
-                raw, KNOWN_DIVISIONS, n=1, cutoff=FUZZY_THRESHOLD
-            )
-            if matches:
-                return matches[0]
+            # Try matching progressively shorter tokens (split on common delimiters)
+            # to handle inputs like "Premier - Season 2" or "Division 1 (Spring)"
+            tokens = re.split(r"[-,(]", raw)
+            candidates_to_try = [raw] + [t.strip() for t in tokens if t.strip()]
+            for candidate in candidates_to_try:
+                close = difflib.get_close_matches(
+                    candidate, KNOWN_DIVISIONS, n=1, cutoff=FUZZY_THRESHOLD
+                )
+                if close:
+                    return close[0]
             raise ParseError(f"Could not identify division from: '{raw}'")
     raise ParseError("No division line found")
 
@@ -112,6 +116,8 @@ def parse_teams(text: str, db) -> tuple[str, str]:
             raw_away = m.group(2).strip()
             home = resolve_team_name(raw_home, db)
             away = resolve_team_name(raw_away, db)
+            if home == away:
+                raise ParseError(f"Home and away teams cannot be the same: '{home}'")
             return home, away
     raise ParseError("No 'vs' line found for team names")
 
