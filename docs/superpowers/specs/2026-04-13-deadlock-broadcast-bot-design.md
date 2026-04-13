@@ -117,6 +117,8 @@ All commands are slash commands restricted to users with the `Administrator` per
 |---|---|
 | `/set-match-channel #channel` | Sets the public server channel to watch for match posts |
 | `/set-broadcast-channel #channel` | Sets the admin server channel for drafts, flags, and notifications |
+| `/unset-match-channel` | Unlinks the match channel; bot stops watching for posts |
+| `/unset-broadcast-channel` | Unlinks the broadcast channel; bot stops posting drafts and flags |
 | `/set-teamup-calendar <calendar-id>` | Sets the TeamUp calendar ID |
 | `/set-teamup-key <api-key>` | Stores the TeamUp API key |
 | `/status` | Shows current config and next 3am run time |
@@ -124,8 +126,22 @@ All commands are slash commands restricted to users with the `Administrator` per
 | `/block-day YYYY-MM-DD [reason]` | Creates an all-day `🚫 NO STREAM` block event on TeamUp and local DB |
 | `/unblock-day YYYY-MM-DD` | Removes the block event for that day |
 | `/list-blocks` | Lists all upcoming blocked days |
+| `/reset` | Resets the bot to its original state (see below) |
 
 The bot refuses to process match posts until `match_channel_id`, `broadcast_channel_id`, `teamup_calendar_id`, and `teamup_api_key` are all configured. `/status` surfaces any missing config.
+
+### `/reset` behaviour
+
+Clears all bot state: config, matches, teams, pending changes, and blocked days. Does **not** delete events already posted to TeamUp (those must be cleared manually in TeamUp). Requires a confirmation prompt before executing:
+
+> ⚠️ This will erase all bot data including match history, team tallies, and configuration. Type `/reset confirm` to proceed.
+
+### Channel deletion handling
+
+The bot listens for Discord's `on_guild_channel_delete` event. If the deleted channel matches a configured channel ID:
+- The corresponding config entry is cleared (`match_channel_id` or `broadcast_channel_id`)
+- The bot posts a warning in the remaining configured channel (if any): `⚠️ A configured channel was deleted. Use /set-match-channel or /set-broadcast-channel to reconfigure.`
+- If no channel is available to post the warning, it is logged to console only.
 
 ---
 
