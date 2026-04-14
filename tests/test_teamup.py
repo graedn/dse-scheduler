@@ -5,7 +5,9 @@ from teamup import TeamUpClient, TeamUpError
 
 @pytest.fixture
 def client():
-    return TeamUpClient(api_key="test-key", calendar_key="my-calendar")
+    c = TeamUpClient(api_key="test-key", calendar_key="my-calendar")
+    c._subcalendar_id = 1  # pre-seed so create_event tests skip the subcalendars API call
+    return c
 
 
 def mock_response(status: int, json_data: dict) -> MagicMock:
@@ -82,6 +84,13 @@ def test_update_event_sends_correct_payload(client):
         assert payload["title"] == "[D1] C vs D"
         assert "start_dt" in payload
         assert "end_dt" in payload
+
+
+def test_create_event_includes_subcalendar_ids(client):
+    with patch.object(client.session, "post", return_value=mock_response(200, {"event": {"id": "1"}})) as mock_post:
+        client.create_event("[Premier] A vs B", 1713657600, 1713664800)
+        payload = mock_post.call_args[1]["json"]
+        assert payload["subcalendar_ids"] == [1]
 
 
 def test_create_event_bad_response_shape_raises(client):
