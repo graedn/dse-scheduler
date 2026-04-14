@@ -21,6 +21,17 @@ class TeamUpClient:
     def _url(self, path: str) -> str:
         return f"{TEAMUP_BASE_URL}/{self.calendar_key}/{path}"
 
+    def _get_subcalendar_id(self) -> int:
+        """Fetch and cache the first sub-calendar ID. Required by TeamUp for all events."""
+        if not hasattr(self, "_subcalendar_id"):
+            resp = self.session.get(self._url("subcalendars"))
+            self._check(resp)
+            subcalendars = resp.json().get("subcalendars", [])
+            if not subcalendars:
+                raise TeamUpError("No sub-calendars found in this TeamUp calendar")
+            self._subcalendar_id = subcalendars[0]["id"]
+        return self._subcalendar_id
+
     def _check(self, resp: requests.Response):
         if not resp.ok:
             raise TeamUpError(f"TeamUp API error {resp.status_code}: {resp.text}")
@@ -44,6 +55,7 @@ class TeamUpClient:
             "start_dt": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_dt": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "all_day": all_day,
+            "subcalendar_ids": [self._get_subcalendar_id()],
         }
         resp = self.session.post(self._url("events"), json=payload)
         self._check(resp)

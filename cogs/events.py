@@ -59,6 +59,13 @@ class EventsCog(commands.Cog):
             best = best_combination(all_matches, self.db)
 
             if best is None:
+                log_ch = self._get_log_channel()
+                if log_ch:
+                    await log_ch.send(
+                        f"ℹ️ Match stored for **{match_date}** "
+                        f"({len(all_matches)} match{'es' if len(all_matches) != 1 else ''} posted that day — "
+                        f"need at least 2 to schedule)."
+                    )
                 return
 
             teamup = self.get_teamup()
