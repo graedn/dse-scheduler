@@ -94,7 +94,7 @@ class AdminCog(commands.Cog):
                 "Administrator permission required.", ephemeral=True
             )
             return
-        self.db.set_config("teamup_api_key", api_key)
+        self.db.set_config("teamup_api_key", api_key.strip())
         await interaction.response.send_message(
             "✅ TeamUp API key saved.", ephemeral=True
         )
@@ -177,6 +177,7 @@ class AdminCog(commands.Cog):
                 "❌ TeamUp not fully configured. Run `/status` to check.", ephemeral=True
             )
             return
+        key_preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else "(too short)"
         import requests
         try:
             resp = requests.get(
@@ -187,12 +188,17 @@ class AdminCog(commands.Cog):
             )
             if resp.ok:
                 await interaction.followup.send(
-                    f"✅ TeamUp connection successful. Calendar ID: `{calendar_id}`",
+                    f"✅ TeamUp connection successful.\n"
+                    f"Calendar: `{calendar_id}`\n"
+                    f"Key ({len(api_key)} chars): `{key_preview}`",
                     ephemeral=True,
                 )
             else:
                 await interaction.followup.send(
-                    f"❌ TeamUp error {resp.status_code}: `{resp.text[:300]}`",
+                    f"❌ TeamUp error {resp.status_code}\n"
+                    f"Calendar: `{calendar_id}`\n"
+                    f"Key ({len(api_key)} chars): `{key_preview}`\n"
+                    f"Response: `{resp.text[:300]}`",
                     ephemeral=True,
                 )
         except Exception as e:
