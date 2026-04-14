@@ -1,4 +1,5 @@
 import logging
+import traceback
 import discord
 from discord.ext import commands
 from datetime import datetime
@@ -34,8 +35,8 @@ class EventsCog(commands.Cog):
 
         try:
             parsed = parse_post(message.content, self.db)
-        except ParseError:
-            await self._flag_error(message)
+        except ParseError as e:
+            await self._flag_parse_error(message, str(e))
             return
 
         match_id = self.db.insert_match(
@@ -62,12 +63,23 @@ class EventsCog(commands.Cog):
 
             teamup = self.get_teamup()
             broadcast_ch = self._get_broadcast_channel()
+            log_ch = self._get_log_channel()
 
             if not scheduled:
                 if teamup:
                     await accept_combination(best, match_date, self.db, teamup, broadcast_ch)
+                    if log_ch:
+                        lines = ", ".join(
+                            f"{m['team_home']} vs {m['team_away']}" for m in best
+                        )
+                        await log_ch.send(
+                            f"📅 TeamUp updated for **{match_date}**: {lines}"
+                        )
                 else:
-                    log.warning("TeamUp not configured — skipping auto-accept for %s", match_date)
+                    msg = f"⚠️ TeamUp not configured — match for {match_date} stored but not added to calendar."
+                    log.warning(msg)
+                    if log_ch:
+                        await log_ch.send(msg)
             else:
                 weekend = is_weekend(scheduled[0]["match_time"])
                 current_score = score_combination(scheduled, weekend, self.db)
@@ -77,30 +89,61 @@ class EventsCog(commands.Cog):
                 if proposed_score <= current_score:
                     return
                 if broadcast_ch is None:
-                    log.warning(
-                        "Broadcast channel not configured — dropping proposal for %s "
-                        "(match_id=%s)", match_date, match_id
+                    msg = (
+                        f"⚠️ Broadcast channel not configured — dropping proposal for "
+                        f"{match_date} (match_id={match_id})"
                     )
+                    log.warning(msg)
+                    if log_ch:
+                        await log_ch.send(msg)
                     return
                 await propose_change(
                     match_date, scheduled, best, current_score, proposed_score,
                     self.db, broadcast_ch,
                 )
         except Exception:
+            tb = traceback.format_exc()
             log.exception("Scheduling failed for match_id=%s on %s", match_id, match_date)
+            log_ch = self._get_log_channel()
+            if log_ch:
+                await log_ch.send(
+                    f"❌ **Scheduling error** for match_id={match_id} on {match_date}:\n"
+                    f"```{tb[-1500:]}```"
+                )
 
-    async def _flag_error(self, message: discord.Message):
-        flag_text = (
-            f"⚠️ Could not parse a match post from **{message.author.display_name}**. "
-            f"Please review:\n```{message.content[:500]}```"
+    async def _flag_parse_error(self, message: discord.Message, reason: str):
+        """DM the player with what specifically failed. Fall back to a reply if DMs are off."""
+        dm_text = (
+            f"⚠️ Your match post couldn't be parsed.\n"
+            f"**Issue:** {reason}\n\n"
+            f"**Your post:**\n```{message.content[:500]}```\n"
+            f"Please fix the issue and repost."
         )
-        await message.reply(flag_text)
-        broadcast_ch = self._get_broadcast_channel()
-        if broadcast_ch:
-            await broadcast_ch.send(flag_text)
+        try:
+            await message.author.send(dm_text)
+        except discord.Forbidden:
+            # User has DMs disabled — reply quietly in channel
+            await message.reply(
+                f"⚠️ Couldn't parse your match post. **Issue:** {reason}",
+                mention_author=True,
+            )
+
+        log_ch = self._get_log_channel()
+        if log_ch:
+            await log_ch.send(
+                f"⚠️ **Parse error** from {message.author.mention} "
+                f"in {message.channel.mention}\n"
+                f"**Issue:** {reason}"
+            )
 
     def _get_broadcast_channel(self):
         ch_id = self.db.get_config("broadcast_channel_id")
+        if ch_id:
+            return self.bot.get_channel(int(ch_id))
+        return None
+
+    def _get_log_channel(self):
+        ch_id = self.db.get_config("log_channel_id")
         if ch_id:
             return self.bot.get_channel(int(ch_id))
         return None

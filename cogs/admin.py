@@ -99,6 +99,33 @@ class AdminCog(commands.Cog):
             "✅ TeamUp API key saved.", ephemeral=True
         )
 
+    @app_commands.command(name="set-log-channel",
+                          description="Set the channel for bot logs, errors, and TeamUp confirmations")
+    async def set_log_channel(self, interaction: discord.Interaction,
+                               channel: discord.TextChannel):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.set_config("log_channel_id", str(channel.id))
+        await interaction.response.send_message(
+            f"✅ Log channel set to {channel.mention}", ephemeral=True
+        )
+
+    @app_commands.command(name="unset-log-channel",
+                          description="Unlink the log channel")
+    async def unset_log_channel(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.delete_config("log_channel_id")
+        await interaction.response.send_message(
+            "✅ Log channel unlinked.", ephemeral=True
+        )
+
     @app_commands.command(name="status",
                           description="Show current bot configuration")
     async def status(self, interaction: discord.Interaction):
@@ -109,6 +136,7 @@ class AdminCog(commands.Cog):
             return
         match_ch = self.db.get_config("match_channel_id")
         broadcast_ch = self.db.get_config("broadcast_channel_id")
+        log_ch = self.db.get_config("log_channel_id")
         calendar_id = self.db.get_config("teamup_calendar_id")
         api_key = self.db.get_config("teamup_api_key")
 
@@ -119,6 +147,7 @@ class AdminCog(commands.Cog):
             "**Bot Status**",
             f"Match channel: {ch_str(match_ch)}",
             f"Broadcast channel: {ch_str(broadcast_ch)}",
+            f"Log channel: {ch_str(log_ch)}",
             f"TeamUp calendar: {'✅ Set' if calendar_id else '❌ Not set'}",
             f"TeamUp API key: {'✅ Set' if api_key else '❌ Not set'}",
         ]
