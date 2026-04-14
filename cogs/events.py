@@ -1,3 +1,4 @@
+import logging
 import discord
 from discord.ext import commands
 from datetime import datetime
@@ -12,6 +13,7 @@ from scheduler import (
 )
 
 ET = ZoneInfo("America/New_York")
+log = logging.getLogger(__name__)
 
 
 class EventsCog(commands.Cog):
@@ -50,31 +52,42 @@ class EventsCog(commands.Cog):
         if self.db.get_blocked_day(match_date):
             return
 
-        all_matches = self.db.get_matches_for_date(match_date)
-        scheduled = self.db.get_scheduled_matches_for_date(match_date)
-        best = best_combination(all_matches, self.db)
+        try:
+            all_matches = self.db.get_matches_for_date(match_date)
+            scheduled = self.db.get_scheduled_matches_for_date(match_date)
+            best = best_combination(all_matches, self.db)
 
-        if best is None:
-            return
-
-        teamup = self.get_teamup()
-        broadcast_ch = self._get_broadcast_channel()
-
-        if not scheduled:
-            if teamup:
-                await accept_combination(best, match_date, self.db, teamup, broadcast_ch)
-        else:
-            weekend = is_weekend(scheduled[0]["match_time"])
-            current_score = score_combination(scheduled, weekend, self.db)
-            proposed_score = score_combination(best, is_weekend(best[0]["match_time"]), self.db)
-            if combo_match_ids(best) == combo_match_ids(scheduled):
+            if best is None:
                 return
-            if proposed_score <= current_score:
-                return
-            await propose_change(
-                match_date, scheduled, best, current_score, proposed_score,
-                self.db, broadcast_ch,
-            )
+
+            teamup = self.get_teamup()
+            broadcast_ch = self._get_broadcast_channel()
+
+            if not scheduled:
+                if teamup:
+                    await accept_combination(best, match_date, self.db, teamup, broadcast_ch)
+                else:
+                    log.warning("TeamUp not configured — skipping auto-accept for %s", match_date)
+            else:
+                weekend = is_weekend(scheduled[0]["match_time"])
+                current_score = score_combination(scheduled, weekend, self.db)
+                proposed_score = score_combination(best, is_weekend(best[0]["match_time"]), self.db)
+                if combo_match_ids(best) == combo_match_ids(scheduled):
+                    return
+                if proposed_score <= current_score:
+                    return
+                if broadcast_ch is None:
+                    log.warning(
+                        "Broadcast channel not configured — dropping proposal for %s "
+                        "(match_id=%s)", match_date, match_id
+                    )
+                    return
+                await propose_change(
+                    match_date, scheduled, best, current_score, proposed_score,
+                    self.db, broadcast_ch,
+                )
+        except Exception:
+            log.exception("Scheduling failed for match_id=%s on %s", match_id, match_date)
 
     async def _flag_error(self, message: discord.Message):
         flag_text = (
@@ -98,6 +111,10 @@ class EventsCog(commands.Cog):
             return
         if str(payload.emoji) != "❌":
             return
+        # Validate that the reaction is in the configured broadcast channel
+        broadcast_ch_id = self.db.get_config("broadcast_channel_id")
+        if not broadcast_ch_id or str(payload.channel_id) != broadcast_ch_id:
+            return
         change = self.db.get_pending_change_by_message(str(payload.message_id))
         if not change:
             return
@@ -110,7 +127,7 @@ class EventsCog(commands.Cog):
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         channel_id = str(channel.id)
         match_ch = self.db.get_config("match_channel_id")
-        broadcast_ch = self.db.get_config("broadcast_channel_id")
+        broadcast_ch_id = self.db.get_config("broadcast_channel_id")
         warning = (
             "⚠️ A configured channel was deleted. "
             "Use `/set-match-channel` or `/set-broadcast-channel` to reconfigure."
@@ -120,7 +137,6 @@ class EventsCog(commands.Cog):
             remaining = self._get_broadcast_channel()
             if remaining:
                 await remaining.send(warning)
-                return
-        if channel_id == broadcast_ch:
+        if channel_id == broadcast_ch_id:
             self.db.delete_config("broadcast_channel_id")
-            print(f"[WARNING] Broadcast channel {channel_id} deleted. No channel to send warning.")
+            log.warning("Broadcast channel %s deleted. No channel to send warning.", channel_id)
