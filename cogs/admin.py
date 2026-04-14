@@ -161,6 +161,45 @@ class AdminCog(commands.Cog):
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+    @app_commands.command(name="test-teamup",
+                          description="Test the TeamUp API connection")
+    async def test_teamup(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        api_key = self.db.get_config("teamup_api_key")
+        calendar_id = self.db.get_config("teamup_calendar_id")
+        if not api_key or not calendar_id:
+            await interaction.followup.send(
+                "❌ TeamUp not fully configured. Run `/status` to check.", ephemeral=True
+            )
+            return
+        import requests
+        try:
+            resp = requests.get(
+                f"https://api.teamup.com/{calendar_id}/events",
+                headers={"Teamup-Token": api_key},
+                params={"startDate": "2026-01-01", "endDate": "2026-01-02"},
+                timeout=10,
+            )
+            if resp.ok:
+                await interaction.followup.send(
+                    f"✅ TeamUp connection successful. Calendar ID: `{calendar_id}`",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"❌ TeamUp error {resp.status_code}: `{resp.text[:300]}`",
+                    ephemeral=True,
+                )
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Request failed: {e}", ephemeral=True
+            )
+
     @app_commands.command(name="broadcast-done",
                           description="Mark a match as broadcast-complete")
     async def broadcast_done(self, interaction: discord.Interaction, match_id: int):
