@@ -1,6 +1,5 @@
 import requests
 from datetime import datetime, timezone
-from typing import Optional
 
 TEAMUP_BASE_URL = "https://api.teamup.com"
 
@@ -48,10 +47,14 @@ class TeamUpClient:
         }
         resp = self.session.post(self._url("events"), json=payload)
         self._check(resp)
-        return str(resp.json()["event"]["id"])
+        try:
+            return str(resp.json()["event"]["id"])
+        except (KeyError, ValueError) as exc:
+            raise TeamUpError(f"Unexpected response shape from create_event: {resp.text}") from exc
 
     def update_event(self, event_id: str, title: str,
                      start_ts: int, end_ts: int) -> None:
+        """Update an existing event's title and times. Raises TeamUpError on failure."""
         start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
         payload = {
@@ -63,5 +66,6 @@ class TeamUpClient:
         self._check(resp)
 
     def delete_event(self, event_id: str) -> None:
+        """Delete an event by ID. Raises TeamUpError on failure."""
         resp = self.session.delete(self._url(f"events/{event_id}"))
         self._check(resp)
