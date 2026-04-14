@@ -24,7 +24,7 @@ def has_required_structure(text: str) -> bool:
     lines = text.strip().split("\n")
     has_division = any(re.match(r"division\s*:", l, re.IGNORECASE) for l in lines)
     has_week = any(re.match(r"(week|round)\s*:", l, re.IGNORECASE) for l in lines)
-    has_vs = any(re.search(r"\bvs\b", l, re.IGNORECASE) for l in lines)
+    has_vs = any(re.search(r"\bvs\.?\b|\bversus\b", l, re.IGNORECASE) for l in lines)
     has_time = any(
         re.search(r"time\s*:.*<t:\d+", l, re.IGNORECASE) for l in lines
     )
@@ -125,7 +125,7 @@ def parse_teams(text: str, db) -> tuple[str, str]:
     for line in text.split("\n"):
         if field_pattern.match(line.strip()):
             continue
-        m = re.search(r"(.+?)\s+vs\s+(.+)", line.strip(), re.IGNORECASE)
+        m = re.search(r"(.+?)\s+(?:vs\.?|versus)\s+(.+)", line.strip(), re.IGNORECASE)
         if m:
             raw_home = m.group(1).strip()
             raw_away = m.group(2).strip()
