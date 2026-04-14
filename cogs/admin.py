@@ -11,6 +11,8 @@ class AdminCog(commands.Cog):
         self.db = db
 
     def _admin_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild:
+            return False
         return interaction.user.guild_permissions.administrator
 
     @app_commands.command(name="set-match-channel",

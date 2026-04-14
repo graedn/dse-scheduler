@@ -3,6 +3,7 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
 from database import Database
+from teamup import TeamUpError
 from typing import Callable, Optional
 
 BLOCK_PREFIX = "🚫 NO STREAM"
@@ -15,6 +16,8 @@ class BlocksCog(commands.Cog):
         self.get_teamup = get_teamup
 
     def _admin_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild:
+            return False
         return interaction.user.guild_permissions.administrator
 
     @app_commands.command(name="block-day",
@@ -34,18 +37,33 @@ class BlocksCog(commands.Cog):
             )
             return
 
+        existing = self.db.get_blocked_day(date)
+        if existing:
+            await interaction.response.send_message(
+                f"⚠️ {date} is already blocked. Use `/unblock-day` first to replace it.",
+                ephemeral=True,
+            )
+            return
+
         title = f"{BLOCK_PREFIX} — {reason}" if reason else BLOCK_PREFIX
         event_id = None
         teamup = self.get_teamup()
         if teamup:
             day_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             day_end = day_start + timedelta(days=1)
-            event_id = teamup.create_event(
-                title,
-                int(day_start.timestamp()),
-                int(day_end.timestamp()),
-                all_day=True,
-            )
+            try:
+                event_id = teamup.create_event(
+                    title,
+                    int(day_start.timestamp()),
+                    int(day_end.timestamp()),
+                    all_day=True,
+                )
+            except TeamUpError as e:
+                await interaction.response.send_message(
+                    f"❌ Failed to create TeamUp event: {e}\nThe day was not blocked.",
+                    ephemeral=True,
+                )
+                return
 
         self.db.insert_blocked_day(date, reason, event_id)
         suffix = f": {reason}" if reason else ""
@@ -69,14 +87,22 @@ class BlocksCog(commands.Cog):
             return
         teamup = self.get_teamup()
         if teamup and blocked.get("teamup_event_id"):
-            teamup.delete_event(blocked["teamup_event_id"])
+            try:
+                teamup.delete_event(blocked["teamup_event_id"])
+            except TeamUpError as e:
+                await interaction.response.send_message(
+                    f"❌ Failed to delete TeamUp event: {e}\n"
+                    f"The local block record was kept. Try again or delete the event manually in TeamUp.",
+                    ephemeral=True,
+                )
+                return
         self.db.delete_blocked_day(date)
         await interaction.response.send_message(
             f"✅ Block removed for {date}.", ephemeral=True
         )
 
     @app_commands.command(name="list-blocks",
-                          description="List all upcoming blocked days")
+                          description="List all blocked days")
     async def list_blocks(self, interaction: discord.Interaction):
         if not self._admin_check(interaction):
             await interaction.response.send_message(
