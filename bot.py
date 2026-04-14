@@ -52,14 +52,14 @@ GUILD_IDS = [
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    # Clear global commands so they don't appear alongside guild-specific ones
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
+    # Sync commands to each guild first (instant), then clear global to remove duplicates
     for guild_id in GUILD_IDS:
         guild = discord.Object(id=guild_id)
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
         print(f"Slash commands synced to guild {guild_id}.")
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync()
     if not scheduler.running:
         scheduler.start()
         print("Scheduler started.")
