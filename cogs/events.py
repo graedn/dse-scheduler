@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from typing import Callable
 
 from database import Database
-from parser import has_required_structure, parse_post, ParseError
+from parser import has_required_structure, has_partial_structure, parse_post, ParseError
 from scheduler import (
     best_combination, score_combination, combo_match_ids,
     is_weekend, accept_combination, propose_change,
@@ -31,7 +31,9 @@ class EventsCog(commands.Cog):
         if not match_channel_id or str(message.channel.id) != match_channel_id:
             return
         if not has_required_structure(message.content):
-            return  # Silent ignore
+            if has_partial_structure(message.content):
+                await self._flag_missing_timestamp(message)
+            return
 
         try:
             parsed = parse_post(message.content, self.db)
@@ -117,6 +119,31 @@ class EventsCog(commands.Cog):
                     f"❌ **Scheduling error** for match_id={match_id} on {match_date}:\n"
                     f"```{tb[-1500:]}```"
                 )
+
+    async def _flag_missing_timestamp(self, message: discord.Message):
+        """DM the player when their post has the right structure but no Discord timestamp."""
+        dm_text = (
+            f"⚠️ Your match post is missing a Discord timestamp.\n\n"
+            f"The `Time:` field needs a Discord timestamp tag so the bot can read the exact time. "
+            f"Visit **hammertime.cyou**, pick your match time, and copy the generated tag.\n\n"
+            f"**It looks like this:**\n"
+            f"```\nTime: <t:1713477600:F>\n```\n"
+            f"**Your post:**\n```{message.content[:500]}```"
+        )
+        try:
+            await message.author.send(dm_text)
+        except discord.Forbidden:
+            await message.reply(
+                "⚠️ Your match post needs a Discord timestamp in the `Time:` field. "
+                "Visit **hammertime.cyou** to generate one.",
+                mention_author=True,
+            )
+        log_ch = self._get_log_channel()
+        if log_ch:
+            await log_ch.send(
+                f"⚠️ **Missing timestamp** from {message.author.mention} "
+                f"in {message.channel.mention}"
+            )
 
     async def _flag_parse_error(self, message: discord.Message, reason: str):
         """DM the player with what specifically failed. Fall back to a reply if DMs are off."""

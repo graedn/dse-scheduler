@@ -28,7 +28,8 @@ class Database:
                 match_time INTEGER NOT NULL,
                 posted_at INTEGER NOT NULL,
                 teamup_event_id TEXT,
-                broadcast_done INTEGER NOT NULL DEFAULT 0
+                broadcast_done INTEGER NOT NULL DEFAULT 0,
+                broadcast_accepted INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS teams (
                 name TEXT PRIMARY KEY,
@@ -53,7 +54,14 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_matches_match_time ON matches (match_time);
         """)
-        self.conn.commit()
+        # Migrate existing databases that predate the broadcast_accepted column
+        try:
+            self.conn.execute(
+                "ALTER TABLE matches ADD COLUMN broadcast_accepted INTEGER NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
+        except Exception:
+            pass  # Column already exists
 
     def _et_day_range(self, date_str: str) -> tuple[int, int]:
         """Return (start_ts, end_ts) Unix seconds for date_str in Eastern Time."""
@@ -130,6 +138,24 @@ class Database:
             "UPDATE matches SET broadcast_done = 1 WHERE id = ?", (match_id,)
         )
         self.conn.commit()
+
+    def mark_broadcast_accepted(self, match_id: int):
+        self.conn.execute(
+            "UPDATE matches SET broadcast_accepted = 1 WHERE id = ?", (match_id,)
+        )
+        self.conn.commit()
+
+    def get_upcoming_matches(self, days: int = 7) -> list[dict]:
+        """All matches in the next N days, ordered by match_time."""
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        now = datetime.now(tz=ZoneInfo("America/New_York"))
+        end = now + timedelta(days=days)
+        rows = self.conn.execute(
+            "SELECT * FROM matches WHERE match_time >= ? AND match_time <= ? ORDER BY match_time",
+            (int(now.timestamp()), int(end.timestamp()))
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_matches_by_teamup_event_id(self, event_id: str) -> list[dict]:
         """Get all matches associated with a given TeamUp event ID."""

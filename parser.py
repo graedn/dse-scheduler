@@ -20,6 +20,17 @@ class ParseError(Exception):
     pass
 
 
+def has_partial_structure(text: str) -> bool:
+    """True if the post looks like a match attempt (has Division + Week) but lacks
+    a valid Discord timestamp — used to flag players who forgot the <t:...> tag."""
+    if has_required_structure(text):
+        return False
+    lines = text.strip().split("\n")
+    has_division = any(re.match(r"division\s*:", l, re.IGNORECASE) for l in lines)
+    has_week = any(re.match(r"(week|round)\s*:", l, re.IGNORECASE) for l in lines)
+    return has_division and has_week
+
+
 def has_required_structure(text: str) -> bool:
     lines = text.strip().split("\n")
     has_division = any(re.match(r"division\s*:", l, re.IGNORECASE) for l in lines)

@@ -166,9 +166,12 @@ async def accept_combination(combo: list[dict], date_str: str, db, teamup,
     # Phase 1: create all TeamUp events (may raise TeamUpError — no DB writes yet)
     created: list[tuple[dict, str]] = []
     for match in combo:
-        title = f"[{match['division']}] {match['team_home']} vs {match['team_away']}"
+        title = (
+            f"[{match['division']}] {match['team_home']} vs {match['team_away']}"
+            f" {{{match['id']}}}"
+        )
         end_ts = match["match_time"] + int(MATCH_DURATION_H * 3600)
-        event_id = teamup.create_event(title, match["match_time"], end_ts)
+        event_id = teamup.create_event(title, match["match_time"], end_ts, subcalendar="proposed")
         created.append((match, event_id))
 
     # Phase 2: all events created — now write DB updates
@@ -281,3 +284,31 @@ async def run_daily_sweep(db, teamup, broadcast_channel) -> None:
             )
 
     await process_expired_changes(db, teamup, broadcast_channel)
+
+
+def build_matches_announcement(db) -> str:
+    """Build the LOGGED MATCHES summary grouped by date and time slot."""
+    from collections import defaultdict
+    matches = db.get_upcoming_matches(days=7)
+    if not matches:
+        return ""
+
+    # Group by ET date, then by exact timestamp
+    by_date: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for match in matches:
+        dt = datetime.fromtimestamp(match["match_time"], tz=ET)
+        date_str = dt.strftime("%Y-%m-%d")
+        by_date[date_str][match["match_time"]] += 1
+
+    lines = ["📋 **LOGGED MATCHES**"]
+    for i, date_str in enumerate(sorted(by_date.keys())):
+        if i > 0:
+            lines.append("─────────────────────")
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=ET)
+        lines.append(f"\n**{dt.strftime('%A %B')}{dt.day}**")
+        for ts in sorted(by_date[date_str].keys()):
+            count = by_date[date_str][ts]
+            noun = "match" if count == 1 else "matches"
+            lines.append(f"• <t:{ts}:t> — {count} {noun} logged")
+
+    return "\n".join(lines)

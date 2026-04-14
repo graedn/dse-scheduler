@@ -6,7 +6,12 @@ from teamup import TeamUpClient, TeamUpError
 @pytest.fixture
 def client():
     c = TeamUpClient(api_key="test-key", calendar_key="my-calendar")
-    c._subcalendar_id = 1  # pre-seed so create_event tests skip the subcalendars API call
+    # Pre-seed subcalendar cache so create_event tests skip the subcalendars API call.
+    # Two entries so keyword-based routing (proposed/accepted) can be tested.
+    c._subcalendars_cache = [
+        {"id": 1, "name": ".Proposed Broadcasts"},
+        {"id": 2, "name": "Accepted Broadcasts"},
+    ]
     return c
 
 
@@ -88,9 +93,16 @@ def test_update_event_sends_correct_payload(client):
 
 def test_create_event_includes_subcalendar_ids(client):
     with patch.object(client.session, "post", return_value=mock_response(200, {"event": {"id": "1"}})) as mock_post:
-        client.create_event("[Premier] A vs B", 1713657600, 1713664800)
+        client.create_event("[Premier] A vs B", 1713657600, 1713664800, subcalendar="proposed")
         payload = mock_post.call_args[1]["json"]
-        assert payload["subcalendar_ids"] == [1]
+        assert payload["subcalendar_ids"] == [1]  # ".Proposed Broadcasts" id
+
+
+def test_create_event_routes_to_accepted_subcalendar(client):
+    with patch.object(client.session, "post", return_value=mock_response(200, {"event": {"id": "1"}})) as mock_post:
+        client.create_event("[Premier] A vs B", 1713657600, 1713664800, subcalendar="accepted")
+        payload = mock_post.call_args[1]["json"]
+        assert payload["subcalendar_ids"] == [2]  # "Accepted Broadcasts" id
 
 
 def test_create_event_bad_response_shape_raises(client):

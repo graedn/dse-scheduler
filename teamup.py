@@ -21,16 +21,23 @@ class TeamUpClient:
     def _url(self, path: str) -> str:
         return f"{TEAMUP_BASE_URL}/{self.calendar_key}/{path}"
 
-    def _get_subcalendar_id(self) -> int:
-        """Fetch and cache the first sub-calendar ID. Required by TeamUp for all events."""
-        if not hasattr(self, "_subcalendar_id"):
+    def _get_subcalendars(self) -> list[dict]:
+        """Fetch and cache all sub-calendars."""
+        if not hasattr(self, "_subcalendars_cache"):
             resp = self.session.get(self._url("subcalendars"))
             self._check(resp)
-            subcalendars = resp.json().get("subcalendars", [])
-            if not subcalendars:
+            self._subcalendars_cache = resp.json().get("subcalendars", [])
+            if not self._subcalendars_cache:
                 raise TeamUpError("No sub-calendars found in this TeamUp calendar")
-            self._subcalendar_id = subcalendars[0]["id"]
-        return self._subcalendar_id
+        return self._subcalendars_cache
+
+    def _find_subcalendar_id(self, keyword: str) -> int:
+        """Return the ID of the sub-calendar whose name contains keyword (case-insensitive).
+        Falls back to the first sub-calendar if no match found."""
+        for sc in self._get_subcalendars():
+            if keyword.lower() in sc["name"].lower():
+                return sc["id"]
+        return self._get_subcalendars()[0]["id"]
 
     def _check(self, resp: requests.Response):
         if not resp.ok:
@@ -46,8 +53,10 @@ class TeamUpClient:
         return resp.json().get("events", [])
 
     def create_event(self, title: str, start_ts: int, end_ts: int,
-                     all_day: bool = False) -> str:
-        """Create an event. Returns the TeamUp event ID as a string."""
+                     all_day: bool = False, subcalendar: str = "proposed") -> str:
+        """Create an event. Returns the TeamUp event ID as a string.
+        subcalendar: keyword to match against sub-calendar names (e.g. 'proposed', 'accepted').
+        """
         start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
         payload = {
@@ -55,7 +64,7 @@ class TeamUpClient:
             "start_dt": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_dt": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "all_day": all_day,
-            "subcalendar_ids": [self._get_subcalendar_id()],
+            "subcalendar_ids": [self._find_subcalendar_id(subcalendar)],
         }
         resp = self.session.post(self._url("events"), json=payload)
         self._check(resp)
@@ -65,8 +74,9 @@ class TeamUpClient:
             raise TeamUpError(f"Unexpected response shape from create_event: {resp.text}") from exc
 
     def update_event(self, event_id: str, title: str,
-                     start_ts: int, end_ts: int) -> None:
-        """Update an existing event's title and times. Raises TeamUpError on failure."""
+                     start_ts: int, end_ts: int,
+                     subcalendar: str = None) -> None:
+        """Update an existing event's title, times, and optionally move it to a sub-calendar."""
         start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
         payload = {
@@ -74,6 +84,8 @@ class TeamUpClient:
             "start_dt": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_dt": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        if subcalendar:
+            payload["subcalendar_ids"] = [self._find_subcalendar_id(subcalendar)]
         resp = self.session.put(self._url(f"events/{event_id}"), json=payload)
         self._check(resp)
 

@@ -2,13 +2,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from database import Database
-from typing import Optional
+from scheduler import build_matches_announcement, MATCH_DURATION_H
+from typing import Callable, Optional
 
 
 class AdminCog(commands.Cog):
-    def __init__(self, bot: commands.Bot, db: Database):
+    def __init__(self, bot: commands.Bot, db: Database, get_teamup: Callable = None):
         self.bot = bot
         self.db = db
+        self.get_teamup = get_teamup
 
     def _admin_check(self, interaction: discord.Interaction) -> bool:
         if not interaction.guild:
@@ -204,6 +206,70 @@ class AdminCog(commands.Cog):
         except Exception as e:
             await interaction.followup.send(
                 f"❌ Request failed: {e}", ephemeral=True
+            )
+
+    @app_commands.command(name="accept-broadcast",
+                          description="Accept a match for broadcast — moves it to Accepted Broadcasts calendar")
+    async def accept_broadcast(self, interaction: discord.Interaction, match_id: int):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        match = self.db.get_match(match_id)
+        if not match:
+            await interaction.followup.send(
+                f"❌ No match found with ID #{match_id}", ephemeral=True
+            )
+            return
+        if match["broadcast_accepted"]:
+            await interaction.followup.send(
+                f"⚠️ Match #{match_id} is already accepted for broadcast.", ephemeral=True
+            )
+            return
+        teamup = self.get_teamup() if self.get_teamup else None
+        if teamup and match.get("teamup_event_id"):
+            end_ts = match["match_time"] + int(MATCH_DURATION_H * 3600)
+            title = (
+                f"[{match['division']}] {match['team_home']} vs {match['team_away']}"
+                f" {{{match_id}}}"
+            )
+            teamup.update_event(
+                match["teamup_event_id"], title,
+                match["match_time"], end_ts,
+                subcalendar="accepted",
+            )
+        self.db.mark_broadcast_accepted(match_id)
+        await interaction.followup.send(
+            f"✅ Match #{match_id} ({match['team_home']} vs {match['team_away']}) "
+            f"moved to Accepted Broadcasts.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="announce-matches",
+                          description="Post the logged matches summary to the broadcast channel now")
+    async def announce_matches_cmd(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        broadcast_ch_id = self.db.get_config("broadcast_channel_id")
+        if not broadcast_ch_id:
+            await interaction.followup.send(
+                "❌ Broadcast channel not configured.", ephemeral=True
+            )
+            return
+        broadcast_ch = self.bot.get_channel(int(broadcast_ch_id))
+        msg = build_matches_announcement(self.db)
+        if msg:
+            await broadcast_ch.send(msg)
+            await interaction.followup.send("✅ Announcement posted.", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "No upcoming matches logged to announce.", ephemeral=True
             )
 
     @app_commands.command(name="broadcast-done",
