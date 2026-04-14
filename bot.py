@@ -23,6 +23,7 @@ intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 db = Database()
+scheduler = AsyncIOScheduler(timezone=ET)
 
 
 def get_teamup() -> "TeamUpClient | None":
@@ -48,24 +49,28 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     await bot.tree.sync()
     print("Slash commands synced.")
-    scheduler.start()
-    print("Scheduler started.")
+    if not scheduler.running:
+        scheduler.start()
+        print("Scheduler started.")
 
 
 async def main():
-    global scheduler
-    scheduler = AsyncIOScheduler(timezone=ET)
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_BOT_TOKEN not set in .env")
+
     scheduler.add_job(daily_sweep_job, "cron", hour=3, minute=0)
 
     await bot.add_cog(AdminCog(bot, db))
     await bot.add_cog(BlocksCog(bot, db, get_teamup))
     await bot.add_cog(EventsCog(bot, db, get_teamup))
 
-    token = os.getenv("DISCORD_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("DISCORD_BOT_TOKEN not set in .env")
-
-    await bot.start(token)
+    try:
+        await bot.start(token)
+    finally:
+        await bot.close()
+        scheduler.shutdown(wait=False)
+        db.close()
 
 
 if __name__ == "__main__":
