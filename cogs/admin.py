@@ -2,15 +2,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from database import Database
-from typing import Callable, Optional
+from typing import Optional
 
 
 class AdminCog(commands.Cog):
-    def __init__(self, bot: commands.Bot, db: Database,
-                 get_teamup: Callable):
+    def __init__(self, bot: commands.Bot, db: Database):
         self.bot = bot
         self.db = db
-        self.get_teamup = get_teamup
 
     def _admin_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.guild_permissions.administrator
@@ -85,6 +83,9 @@ class AdminCog(commands.Cog):
 
     @app_commands.command(name="set-teamup-key",
                           description="Set the TeamUp API key")
+    # NOTE: Discord logs slash command invocations (including arguments) to the server
+    # audit log. Prefer restricting audit log access before using this command, or
+    # rotate the key after any suspected exposure.
     async def set_teamup_key(self, interaction: discord.Interaction, api_key: str):
         if not self._admin_check(interaction):
             await interaction.response.send_message(
