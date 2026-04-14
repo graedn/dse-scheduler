@@ -31,15 +31,30 @@ def has_required_structure(text: str) -> bool:
     return all([has_division, has_week, has_vs, has_time])
 
 
+def _normalize_division(raw: str) -> str:
+    """Convert shorthand like '1', 'div 1', 'div. 2' to 'Division N' before fuzzy matching."""
+    s = raw.strip()
+    # Bare number: "1" → "Division 1"
+    if re.fullmatch(r"\d", s):
+        return f"Division {s}"
+    # "div 1", "div. 1", "div1" → "Division 1"
+    m = re.match(r"div\.?\s*(\d)", s, re.IGNORECASE)
+    if m:
+        return f"Division {m.group(1)}"
+    return s
+
+
 def parse_division(text: str) -> str:
     for line in text.split("\n"):
         m = re.match(r"division\s*:\s*(.+)", line.strip(), re.IGNORECASE)
         if m:
             raw = m.group(1).strip()
+            # Normalise shorthand before fuzzy matching
+            normalized = _normalize_division(raw)
             # Try matching progressively shorter tokens (split on common delimiters)
             # to handle inputs like "Premier - Season 2" or "Division 1 (Spring)"
-            tokens = re.split(r"[-,(]", raw)
-            candidates_to_try = [raw] + [t.strip() for t in tokens if t.strip()]
+            tokens = re.split(r"[-,(]", normalized)
+            candidates_to_try = [normalized] + [t.strip() for t in tokens if t.strip()]
             for candidate in candidates_to_try:
                 close = difflib.get_close_matches(
                     candidate, KNOWN_DIVISIONS, n=1, cutoff=FUZZY_THRESHOLD
