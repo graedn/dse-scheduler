@@ -52,7 +52,26 @@ class Database:
                 reason TEXT,
                 teamup_event_id TEXT
             );
+            CREATE TABLE IF NOT EXISTS broadcast_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL UNIQUE,
+                discord_message_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS broadcast_signups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL,
+                message_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                signed_up_at INTEGER NOT NULL,
+                UNIQUE (match_id, role, user_id)
+            );
             CREATE INDEX IF NOT EXISTS idx_matches_match_time ON matches (match_time);
+            CREATE INDEX IF NOT EXISTS idx_broadcast_messages_msg_id ON broadcast_messages (discord_message_id);
+            CREATE INDEX IF NOT EXISTS idx_broadcast_signups_match ON broadcast_signups (match_id);
         """)
         # Migrate existing databases that predate the broadcast_accepted column
         try:
@@ -156,6 +175,13 @@ class Database:
             (int(now.timestamp()), int(end.timestamp()))
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def match_exists(self, team_home: str, team_away: str, match_time: int) -> bool:
+        row = self.conn.execute(
+            "SELECT id FROM matches WHERE team_home = ? AND team_away = ? AND match_time = ?",
+            (team_home, team_away, match_time)
+        ).fetchone()
+        return row is not None
 
     def get_matches_by_teamup_event_id(self, event_id: str) -> list[dict]:
         """Get all matches associated with a given TeamUp event ID."""
@@ -290,6 +316,70 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # --- Broadcast messages (sign-up messages per match) ---
+
+    def insert_broadcast_message(self, match_id: int, discord_message_id: str,
+                                  channel_id: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO broadcast_messages "
+            "(match_id, discord_message_id, channel_id) VALUES (?, ?, ?)",
+            (match_id, discord_message_id, channel_id)
+        )
+        self.conn.commit()
+
+    def get_broadcast_message(self, match_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM broadcast_messages WHERE match_id = ?", (match_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_match_by_broadcast_message(self, discord_message_id: str) -> Optional[dict]:
+        """Return the match associated with a sign-up message, or None."""
+        row = self.conn.execute(
+            "SELECT m.* FROM matches m "
+            "JOIN broadcast_messages bm ON m.id = bm.match_id "
+            "WHERE bm.discord_message_id = ?",
+            (discord_message_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    # --- Broadcast signups (talent sign-up per match) ---
+
+    def upsert_signup(self, match_id: int, message_id: str, role: str,
+                      user_id: str, username: str, display_name: str) -> bool:
+        """Insert a signup. Returns True if newly inserted, False if already exists."""
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO broadcast_signups "
+            "(match_id, message_id, role, user_id, username, display_name, signed_up_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (match_id, message_id, role, user_id, username, display_name, int(time.time()))
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def remove_signup(self, match_id: int, role: str, user_id: str) -> bool:
+        """Remove a signup. Returns True if a row was deleted."""
+        cur = self.conn.execute(
+            "DELETE FROM broadcast_signups "
+            "WHERE match_id = ? AND role = ? AND user_id = ?",
+            (match_id, role, user_id)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def get_signups_for_match(self, match_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM broadcast_signups WHERE match_id = ? ORDER BY signed_up_at",
+            (match_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_matches_with_teamup_id(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM matches WHERE teamup_event_id IS NOT NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- Reset ---
 
     def reset_all(self):
@@ -299,6 +389,8 @@ class Database:
             DELETE FROM teams;
             DELETE FROM pending_changes;
             DELETE FROM blocked_days;
+            DELETE FROM broadcast_messages;
+            DELETE FROM broadcast_signups;
         """)
         self.conn.commit()
 

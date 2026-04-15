@@ -27,14 +27,14 @@ def has_partial_structure(text: str) -> bool:
         return False
     lines = text.strip().split("\n")
     has_division = any(re.match(r"division\s*:", l, re.IGNORECASE) for l in lines)
-    has_week = any(re.match(r"(week|round)\s*:", l, re.IGNORECASE) for l in lines)
+    has_week = any(re.match(r"(week|round)\s*:?\s*\d", l, re.IGNORECASE) for l in lines)
     return has_division and has_week
 
 
 def has_required_structure(text: str) -> bool:
     lines = text.strip().split("\n")
     has_division = any(re.match(r"division\s*:", l, re.IGNORECASE) for l in lines)
-    has_week = any(re.match(r"(week|round)\s*:", l, re.IGNORECASE) for l in lines)
+    has_week = any(re.match(r"(week|round)\s*:?\s*\d", l, re.IGNORECASE) for l in lines)
     has_vs = any(re.search(r"\bvs\.?\b|\bversus\b", l, re.IGNORECASE) for l in lines)
     has_time = any(
         re.search(r"time\s*:.*<t:\d+", l, re.IGNORECASE) for l in lines
@@ -78,7 +78,7 @@ def parse_division(text: str) -> str:
 
 def parse_week(text: str) -> str:
     for line in text.split("\n"):
-        m = re.match(r"(week|round)\s*:\s*(.+)", line.strip(), re.IGNORECASE)
+        m = re.match(r"(week|round)\s*:?\s*(.+)", line.strip(), re.IGNORECASE)
         if m:
             label = m.group(1).capitalize()
             raw = m.group(2).strip()

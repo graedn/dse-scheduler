@@ -1,5 +1,6 @@
 import requests
 from datetime import datetime, timezone
+from typing import Optional
 
 TEAMUP_BASE_URL = "https://api.teamup.com"
 
@@ -75,8 +76,9 @@ class TeamUpClient:
 
     def update_event(self, event_id: str, title: str,
                      start_ts: int, end_ts: int,
-                     subcalendar: str = None) -> None:
-        """Update an existing event's title, times, and optionally move it to a sub-calendar."""
+                     subcalendar: Optional[str] = None,
+                     description: Optional[str] = None) -> None:
+        """Update an existing event's title, times, sub-calendar, and optionally description."""
         start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
         payload = {
@@ -86,6 +88,8 @@ class TeamUpClient:
         }
         if subcalendar:
             payload["subcalendar_ids"] = [self._find_subcalendar_id(subcalendar)]
+        if description is not None:
+            payload["notes"] = description
         resp = self.session.put(self._url(f"events/{event_id}"), json=payload)
         self._check(resp)
 

@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from database import Database
 from teamup import TeamUpClient
-from scheduler import run_daily_sweep, build_matches_announcement
+from scheduler import run_daily_sweep, run_morning_check, build_matches_announcement
 from cogs.admin import AdminCog
 from cogs.blocks import BlocksCog
 from cogs.events import EventsCog
@@ -43,6 +43,16 @@ async def announce_job():
             await broadcast_ch.send(msg)
     else:
         print("[announce] Skipped — broadcast channel not configured.")
+
+
+async def morning_job():
+    teamup = get_teamup()
+    broadcast_ch_id = db.get_config("broadcast_channel_id")
+    broadcast_ch = bot.get_channel(int(broadcast_ch_id)) if broadcast_ch_id else None
+    if teamup and broadcast_ch:
+        await run_morning_check(db, teamup, broadcast_ch)
+    else:
+        print("[morning] Skipped — missing TeamUp credentials or broadcast channel.")
 
 
 async def daily_sweep_job():
@@ -82,6 +92,7 @@ async def main():
         raise RuntimeError("DISCORD_BOT_TOKEN not set in .env")
 
     scheduler.add_job(daily_sweep_job, "cron", hour=3, minute=0)
+    scheduler.add_job(morning_job, "cron", hour=9, minute=0)     # 9am ET day-of check
     scheduler.add_job(announce_job, "cron", hour=11, minute=0)   # 11am ET
     scheduler.add_job(announce_job, "cron", hour=23, minute=0)   # 11pm ET
 

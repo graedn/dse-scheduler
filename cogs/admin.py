@@ -300,6 +300,24 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.command(name="sync-history",
+                          description="Scan the match channel history and log any future matches")
+    async def sync_history(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        events_cog = self.bot.cogs.get("EventsCog")
+        if not events_cog:
+            await interaction.followup.send("❌ EventsCog not loaded.", ephemeral=True)
+            return
+        await events_cog._scan_match_history()
+        await interaction.followup.send(
+            "✅ History scan complete. Check the log channel for results.", ephemeral=True
+        )
+
     @app_commands.command(name="reset",
                           description="Reset the bot to its original state")
     async def reset(self, interaction: discord.Interaction, confirm: bool = False):
@@ -315,7 +333,28 @@ class AdminCog(commands.Cog):
                 ephemeral=True,
             )
             return
+        await interaction.response.defer(ephemeral=True)
+        # Delete all TeamUp events before wiping the database
+        teamup = self.get_teamup() if self.get_teamup else None
+        deleted, failed = 0, 0
+        if teamup:
+            for match in self.db.get_all_matches_with_teamup_id():
+                try:
+                    teamup.delete_event(match["teamup_event_id"])
+                    deleted += 1
+                except Exception:
+                    failed += 1
+            for day in self.db.get_all_blocked_days():
+                if day.get("teamup_event_id"):
+                    try:
+                        teamup.delete_event(day["teamup_event_id"])
+                        deleted += 1
+                    except Exception:
+                        failed += 1
         self.db.reset_all()
-        await interaction.response.send_message(
-            "✅ Bot has been reset to its original state.", ephemeral=True
+        summary = f"Removed {deleted} TeamUp event(s) from the calendar." if teamup else "TeamUp not configured — calendar events were not cleared."
+        if failed:
+            summary += f" ({failed} deletion(s) failed — remove manually.)"
+        await interaction.followup.send(
+            f"✅ Bot has been reset to its original state.\n{summary}", ephemeral=True
         )
