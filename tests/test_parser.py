@@ -167,3 +167,85 @@ def test_parse_teams_same_team_raises():
     post = "Division: Premier\nWeek: 1\nAlpha Squad vs Alpha Squad\nTime: <t:123:F>"
     with pytest.raises(ParseError):
         parse_post(post, db)
+
+
+# --- has_partial_structure ---
+
+from parser import has_partial_structure
+
+def test_has_partial_structure_division_and_week_no_timestamp():
+    post = "Division: Premier\nWeek: 3\nTeam A vs Team B"
+    assert has_partial_structure(post) is True
+
+
+def test_has_partial_structure_false_when_has_required():
+    # A fully valid post is NOT partial
+    assert has_partial_structure(VALID_POST) is False
+
+
+def test_has_partial_structure_false_when_only_division():
+    post = "Division: Premier\nSome other text"
+    assert has_partial_structure(post) is False
+
+
+def test_has_partial_structure_false_when_only_week():
+    post = "Week: 3\nTeam A vs Team B"
+    assert has_partial_structure(post) is False
+
+
+# --- _normalize_division ---
+
+from parser import _normalize_division
+
+def test_normalize_division_bare_number():
+    assert _normalize_division("1") == "Division 1"
+
+
+def test_normalize_division_div_prefix():
+    assert _normalize_division("div 2") == "Division 2"
+
+
+def test_normalize_division_div_dot():
+    assert _normalize_division("div.3") == "Division 3"
+
+
+def test_normalize_division_passthrough():
+    assert _normalize_division("Premier") == "Premier"
+
+
+# --- versus keyword ---
+
+def test_has_required_structure_accepts_versus():
+    post = "Division: Premier\nWeek: 3\nTeam A versus Team B\nTime: <t:1713387600:F>"
+    assert has_required_structure(post) is True
+
+
+def test_parse_teams_accepts_versus():
+    db = make_db_with_teams({})
+    post = "Division: Premier\nWeek: 1\nAlpha Squad versus Beta Squad\nTime: <t:123:F>"
+    result = parse_post(post, db)
+    assert "Alpha" in result.team_home or "Alpha" in result.team_away
+
+
+# --- Timestamp format variants ---
+
+def test_parse_timestamp_with_lowercase_r():
+    assert parse_timestamp("Time: <t:1713387600:r>") == 1713387600
+
+
+def test_parse_timestamp_with_uppercase_d():
+    assert parse_timestamp("Time: <t:1713387600:D>") == 1713387600
+
+
+def test_parse_timestamp_no_format_suffix():
+    assert parse_timestamp("Time: <t:1713387600>") == 1713387600
+
+
+# --- parse_division shorthand ---
+
+def test_parse_division_bare_number_shorthand():
+    assert parse_division("Division: 1") == "Division 1"
+
+
+def test_parse_division_div_prefix_shorthand():
+    assert parse_division("Division: div 2") == "Division 2"
