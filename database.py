@@ -72,12 +72,47 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_matches_match_time ON matches (match_time);
             CREATE INDEX IF NOT EXISTS idx_broadcast_messages_msg_id ON broadcast_messages (discord_message_id);
             CREATE INDEX IF NOT EXISTS idx_broadcast_signups_match ON broadcast_signups (match_id);
+            CREATE TABLE IF NOT EXISTS managers (
+                user_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                added_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS talent (
+                user_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                broadcast_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS talent_allocations (
+                match_id INTEGER PRIMARY KEY,
+                role_assignments TEXT,
+                confirmations TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                confirmation_message_id TEXT,
+                confirmation_channel_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_talent_alloc_conf_msg
+                ON talent_allocations (confirmation_message_id);
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id TEXT PRIMARY KEY,
+                timezone TEXT NOT NULL DEFAULT 'America/New_York'
+            );
         """)
         # Migrate existing databases that predate the broadcast_accepted column
         try:
             self.conn.execute(
                 "ALTER TABLE matches ADD COLUMN broadcast_accepted INTEGER NOT NULL DEFAULT 0"
             )
+            self.conn.commit()
+        except Exception:
+            pass  # Column already exists
+        # Migrate: sign-up deadline per match
+        try:
+            self.conn.execute("ALTER TABLE matches ADD COLUMN signup_deadline INTEGER")
             self.conn.commit()
         except Exception:
             pass  # Column already exists
@@ -161,6 +196,12 @@ class Database:
     def mark_broadcast_accepted(self, match_id: int):
         self.conn.execute(
             "UPDATE matches SET broadcast_accepted = 1 WHERE id = ?", (match_id,)
+        )
+        self.conn.commit()
+
+    def clear_broadcast_accepted(self, match_id: int):
+        self.conn.execute(
+            "UPDATE matches SET broadcast_accepted = 0 WHERE id = ?", (match_id,)
         )
         self.conn.commit()
 
@@ -283,6 +324,28 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def update_pending_change_message(self, change_id: int, discord_message_id: str,
+                                       description: str) -> None:
+        self.conn.execute(
+            "UPDATE pending_changes SET discord_message_id = ?, description = ? WHERE id = ?",
+            (discord_message_id, description, change_id)
+        )
+        self.conn.commit()
+
+    def get_all_pending_changes(self) -> list[dict]:
+        """All unresolved pending changes (for re-registering ProposalViews on startup)."""
+        rows = self.conn.execute(
+            "SELECT * FROM pending_changes WHERE approved IS NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_awaiting_confirmation_matches(self) -> list[dict]:
+        """Match IDs of allocations awaiting talent confirmation (for ConfirmationView startup)."""
+        rows = self.conn.execute(
+            "SELECT match_id FROM talent_allocations WHERE status = 'awaiting_confirm'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def resolve_pending_change(self, change_id: int, approved: bool):
         self.conn.execute(
             "UPDATE pending_changes SET approved = ? WHERE id = ?",
@@ -380,6 +443,244 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_accepted_broadcast_matches(self) -> list[dict]:
+        """Accepted matches that still have a sign-up broadcast message (for persistent view re-registration)."""
+        rows = self.conn.execute(
+            "SELECT m.* FROM matches m "
+            "JOIN broadcast_messages bm ON m.id = bm.match_id "
+            "WHERE m.broadcast_accepted = 1"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_active_sign_up_matches(self) -> list[dict]:
+        """Matches that have a broadcast sign-up message and are not yet talent-accepted."""
+        rows = self.conn.execute(
+            "SELECT m.* FROM matches m "
+            "JOIN broadcast_messages bm ON m.id = bm.match_id "
+            "WHERE m.broadcast_accepted = 0 AND m.teamup_event_id IS NOT NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Managers ---
+
+    def add_manager(self, user_id: str, username: str, display_name: str,
+                    added_by: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO managers "
+            "(user_id, username, display_name, added_by, added_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, display_name, added_by, int(time.time()))
+        )
+        self.conn.commit()
+
+    def remove_manager(self, user_id: str) -> bool:
+        cur = self.conn.execute("DELETE FROM managers WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def is_manager(self, user_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM managers WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row is not None
+
+    def get_all_managers(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM managers ORDER BY added_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Signup deadline ---
+
+    def set_signup_deadline(self, match_id: int, deadline: int) -> None:
+        self.conn.execute(
+            "UPDATE matches SET signup_deadline = ? WHERE id = ?", (deadline, match_id)
+        )
+        self.conn.commit()
+
+    def get_matches_past_deadline(self) -> list[dict]:
+        """Matches whose sign-up deadline has passed but no allocation record exists yet."""
+        now = int(time.time())
+        rows = self.conn.execute(
+            "SELECT * FROM matches WHERE signup_deadline IS NOT NULL "
+            "AND signup_deadline <= ? AND broadcast_accepted = 0 "
+            "AND teamup_event_id IS NOT NULL "
+            "AND id NOT IN (SELECT match_id FROM talent_allocations)",
+            (now,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_pending_changes_for_date(self, date_str: str) -> list[dict]:
+        """Pending changes that involve at least one match on the given date."""
+        pending = self.get_all_pending_changes()
+        day_match_ids = {m["id"] for m in self.get_matches_for_date(date_str)}
+        result = []
+        for change in pending:
+            new_ids = set(json.loads(change.get("new_match_ids") or "[]"))
+            if new_ids & day_match_ids:
+                result.append(change)
+                continue
+            for eid in json.loads(change.get("old_event_ids") or "[]"):
+                if any(m["id"] in day_match_ids
+                       for m in self.get_matches_by_teamup_event_id(eid)):
+                    result.append(change)
+                    break
+        return result
+
+    def get_matches_past_calltime_last_call(self) -> list[dict]:
+        """Matches in 'last_call' allocation state whose call time (30 min before match) has passed."""
+        now = int(time.time())
+        call_offset = 1800  # seconds before match_time
+        rows = self.conn.execute(
+            "SELECT m.* FROM matches m "
+            "JOIN talent_allocations ta ON m.id = ta.match_id "
+            "WHERE ta.status = 'last_call' "
+            "AND (m.match_time - ?) <= ? "
+            "AND m.broadcast_accepted = 0",
+            (call_offset, now)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Talent broadcast counts ---
+
+    def get_talent_count(self, user_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT broadcast_count FROM talent WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row["broadcast_count"] if row else 0
+
+    def increment_talent_broadcast(self, user_id: str, username: str,
+                                   display_name: str) -> None:
+        self.conn.execute(
+            "INSERT INTO talent (user_id, username, display_name, broadcast_count) "
+            "VALUES (?, ?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET "
+            "broadcast_count = broadcast_count + 1, "
+            "username = excluded.username, display_name = excluded.display_name",
+            (user_id, username, display_name)
+        )
+        self.conn.commit()
+
+    def get_all_talent(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM talent WHERE broadcast_count > 0 "
+            "ORDER BY broadcast_count DESC, display_name ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Talent allocations ---
+
+    def create_allocation(self, match_id: int) -> None:
+        now = int(time.time())
+        self.conn.execute(
+            "INSERT OR IGNORE INTO talent_allocations "
+            "(match_id, confirmations, status, created_at, updated_at) "
+            "VALUES (?, '{}', 'pending', ?, ?)",
+            (match_id, now, now)
+        )
+        self.conn.commit()
+
+    def get_allocation(self, match_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM talent_allocations WHERE match_id = ?", (match_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_allocation_by_confirmation_message(self,
+                                               message_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM talent_allocations WHERE confirmation_message_id = ?",
+            (message_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_allocation_assignments(self, match_id: int, role_assignments: dict,
+                                   confirmations: dict,
+                                   confirmation_message_id: Optional[str],
+                                   confirmation_channel_id: Optional[str]) -> None:
+        now = int(time.time())
+        self.conn.execute(
+            "UPDATE talent_allocations SET "
+            "role_assignments = ?, confirmations = ?, status = 'awaiting_confirm', "
+            "confirmation_message_id = ?, confirmation_channel_id = ?, updated_at = ? "
+            "WHERE match_id = ?",
+            (json.dumps(role_assignments), json.dumps(confirmations),
+             confirmation_message_id, confirmation_channel_id, now, match_id)
+        )
+        self.conn.commit()
+
+    def set_confirmation(self, match_id: int, user_id: str, confirmed: bool) -> None:
+        row = self.conn.execute(
+            "SELECT confirmations FROM talent_allocations WHERE match_id = ?",
+            (match_id,)
+        ).fetchone()
+        if not row:
+            return
+        confirmations = json.loads(row["confirmations"])
+        confirmations[user_id] = confirmed
+        self.conn.execute(
+            "UPDATE talent_allocations SET confirmations = ?, updated_at = ? "
+            "WHERE match_id = ?",
+            (json.dumps(confirmations), int(time.time()), match_id)
+        )
+        self.conn.commit()
+
+    def get_confirmations(self, match_id: int) -> dict:
+        row = self.conn.execute(
+            "SELECT confirmations FROM talent_allocations WHERE match_id = ?",
+            (match_id,)
+        ).fetchone()
+        return json.loads(row["confirmations"]) if row else {}
+
+    def set_allocation_status(self, match_id: int, status: str) -> None:
+        self.conn.execute(
+            "UPDATE talent_allocations SET status = ?, updated_at = ? WHERE match_id = ?",
+            (status, int(time.time()), match_id)
+        )
+        self.conn.commit()
+
+    def reset_allocation(self, match_id: int) -> None:
+        """Clear assignment data so the manager can re-allocate."""
+        self.conn.execute(
+            "UPDATE talent_allocations SET "
+            "role_assignments = NULL, confirmations = '{}', status = 'pending', "
+            "confirmation_message_id = NULL, confirmation_channel_id = NULL, "
+            "updated_at = ? WHERE match_id = ?",
+            (int(time.time()), match_id)
+        )
+        self.conn.commit()
+
+    # --- User settings ---
+
+    def get_user_timezone(self, user_id: str) -> str:
+        row = self.conn.execute(
+            "SELECT timezone FROM user_settings WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row["timezone"] if row else "America/New_York"
+
+    def set_user_timezone(self, user_id: str, tz_name: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO user_settings (user_id, timezone) VALUES (?, ?)",
+            (user_id, tz_name)
+        )
+        self.conn.commit()
+
+    def reset_season(self) -> None:
+        """Clear all season data while preserving config and managers."""
+        self.conn.executescript("""
+            DELETE FROM matches;
+            DELETE FROM teams;
+            DELETE FROM pending_changes;
+            DELETE FROM blocked_days;
+            DELETE FROM broadcast_messages;
+            DELETE FROM broadcast_signups;
+            DELETE FROM talent;
+            DELETE FROM talent_allocations;
+            DELETE FROM sqlite_sequence WHERE name IN (
+                'matches', 'pending_changes', 'broadcast_messages',
+                'broadcast_signups', 'talent_allocations'
+            );
+        """)
+        self.conn.commit()
+
     # --- Reset ---
 
     def reset_all(self):
@@ -391,6 +692,14 @@ class Database:
             DELETE FROM blocked_days;
             DELETE FROM broadcast_messages;
             DELETE FROM broadcast_signups;
+            DELETE FROM managers;
+            DELETE FROM talent;
+            DELETE FROM talent_allocations;
+            DELETE FROM user_settings;
+            DELETE FROM sqlite_sequence WHERE name IN (
+                'matches', 'pending_changes', 'broadcast_messages',
+                'broadcast_signups', 'talent_allocations'
+            );
         """)
         self.conn.commit()
 

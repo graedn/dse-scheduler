@@ -20,13 +20,20 @@ class BlocksCog(commands.Cog):
             return False
         return interaction.user.guild_permissions.administrator
 
+    def _manager_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild:
+            return False
+        if interaction.user.guild_permissions.administrator:
+            return True
+        return self.db.is_manager(str(interaction.user.id))
+
     @app_commands.command(name="block-day",
                           description="Block a day from broadcast scheduling")
     async def block_day(self, interaction: discord.Interaction,
                         date: str, reason: Optional[str] = None):
-        if not self._admin_check(interaction):
+        if not self._manager_check(interaction):
             await interaction.response.send_message(
-                "Administrator permission required.", ephemeral=True
+                "Manager or Administrator permission required.", ephemeral=True
             )
             return
         try:
@@ -49,14 +56,17 @@ class BlocksCog(commands.Cog):
         event_id = None
         teamup = self.get_teamup()
         if teamup:
-            day_start = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            day_end = day_start + timedelta(days=1)
+            from zoneinfo import ZoneInfo
+            _ET = ZoneInfo("America/New_York")
+            day_start = datetime.strptime(date, "%Y-%m-%d").replace(
+                tzinfo=_ET, hour=0, minute=1, second=0
+            )
+            day_end = day_start.replace(hour=23, minute=59, second=0)
             try:
                 event_id = teamup.create_event(
                     title,
                     int(day_start.timestamp()),
                     int(day_end.timestamp()),
-                    all_day=True,
                 )
             except TeamUpError as e:
                 await interaction.response.send_message(
@@ -74,9 +84,9 @@ class BlocksCog(commands.Cog):
     @app_commands.command(name="unblock-day",
                           description="Remove a broadcast block for a day")
     async def unblock_day(self, interaction: discord.Interaction, date: str):
-        if not self._admin_check(interaction):
+        if not self._manager_check(interaction):
             await interaction.response.send_message(
-                "Administrator permission required.", ephemeral=True
+                "Manager or Administrator permission required.", ephemeral=True
             )
             return
         blocked = self.db.get_blocked_day(date)
@@ -104,9 +114,9 @@ class BlocksCog(commands.Cog):
     @app_commands.command(name="list-blocks",
                           description="List all blocked days")
     async def list_blocks(self, interaction: discord.Interaction):
-        if not self._admin_check(interaction):
+        if not self._manager_check(interaction):
             await interaction.response.send_message(
-                "Administrator permission required.", ephemeral=True
+                "Manager or Administrator permission required.", ephemeral=True
             )
             return
         blocks = self.db.get_all_blocked_days()

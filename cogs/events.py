@@ -1,3 +1,4 @@
+import json
 import logging
 import traceback
 import discord
@@ -11,10 +12,9 @@ from parser import has_required_structure, has_partial_structure, parse_post, Pa
 from scheduler import (
     accept_combination, schedule_for_date,
     apply_pending_change, _fmt_date,
-    EMOJI_TO_ROLE, SIGNUP_EMOJIS,
-    build_signup_message, is_fully_staffed,
-    build_talent_description, MATCH_DURATION_H,
+    MATCH_DURATION_H,
 )
+from cogs.talent import send_allocation_request
 
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger(__name__)
@@ -45,11 +45,7 @@ class EventsCog(commands.Cog):
         await self._scan_match_history()
 
     async def _scan_match_history(self):
-        """Scan the match channel history and log future matches not yet in the DB.
-
-        Skips past matches. Deduplicates by (team_home, team_away, match_time).
-        After logging, attempts to schedule the best 2-match block for each new date.
-        """
+        """Scan the match channel history and log future matches not yet in the DB."""
         match_ch_id = self.db.get_config("match_channel_id")
         channel = self.bot.get_channel(int(match_ch_id)) if match_ch_id else None
         if not channel:
@@ -57,6 +53,7 @@ class EventsCog(commands.Cog):
 
         log_ch = self._get_log_channel()
         broadcast_ch = self._get_broadcast_channel()
+        signup_ch = self._get_signup_channel()
         now_ts = int(datetime.now(tz=ET).timestamp())
         new_count = 0
         dates_with_new: set[str] = set()
@@ -95,11 +92,11 @@ class EventsCog(commands.Cog):
             else:
                 await log_ch.send("🔍 History scan complete: no new future matches found.")
 
-        # Run the full scheduling logic for each affected date
         teamup = self.get_teamup()
         for date_str in sorted(dates_with_new):
             try:
-                await schedule_for_date(date_str, self.db, teamup, broadcast_ch, log_ch)
+                await schedule_for_date(date_str, self.db, teamup, broadcast_ch, log_ch,
+                                        signup_channel=signup_ch)
             except Exception:
                 if log_ch:
                     await log_ch.send(
@@ -139,6 +136,7 @@ class EventsCog(commands.Cog):
             await schedule_for_date(
                 match_date, self.db, self.get_teamup(),
                 self._get_broadcast_channel(), self._get_log_channel(),
+                signup_channel=self._get_signup_channel(),
             )
         except Exception:
             tb = traceback.format_exc()
@@ -181,7 +179,7 @@ class EventsCog(commands.Cog):
             )
 
     async def _flag_parse_error(self, message: discord.Message, reason: str):
-        """DM the player with what specifically failed. Fall back to a reply if DMs are off."""
+        """DM the player with what specifically failed."""
         dm_text = (
             f"⚠️ Your match post couldn't be parsed.\n"
             f"**Issue:** {reason}\n\n"
@@ -191,7 +189,6 @@ class EventsCog(commands.Cog):
         try:
             await message.author.send(dm_text)
         except discord.Forbidden:
-            # User has DMs disabled — reply quietly in channel
             await message.reply(
                 f"⚠️ Couldn't parse your match post. **Issue:** {reason}",
                 mention_author=True,
@@ -211,151 +208,50 @@ class EventsCog(commands.Cog):
             return self.bot.get_channel(int(ch_id))
         return None
 
+    def _get_signup_channel(self):
+        ch_id = self.db.get_config("signup_channel_id")
+        if ch_id:
+            return self.bot.get_channel(int(ch_id))
+        return None
+
     def _get_log_channel(self):
         ch_id = self.db.get_config("log_channel_id")
         if ch_id:
             return self.bot.get_channel(int(ch_id))
         return None
 
-    @commands.Cog.listener()
-    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
-        if payload.user_id == self.bot.user.id:
-            return
-        emoji = str(payload.emoji)
-        broadcast_ch_id = self.db.get_config("broadcast_channel_id")
-        if not broadcast_ch_id or str(payload.channel_id) != broadcast_ch_id:
-            return
-
-        # --- Proposal approval / rejection ---
-        if emoji in ("✅", "❌"):
-            change = self.db.get_pending_change_by_message(str(payload.message_id))
-            if not change:
-                return
-            broadcast_ch = self._get_broadcast_channel()
-            if emoji == "❌":
-                self.db.resolve_pending_change(change["id"], approved=False)
-                if broadcast_ch:
-                    await broadcast_ch.send("❌ Schedule proposal rejected.")
-            else:
-                teamup = self.get_teamup()
-                date_str = await apply_pending_change(change, self.db, teamup, broadcast_ch)
-                if broadcast_ch and date_str:
-                    await broadcast_ch.send(
-                        f"✅ Schedule proposal approved for {_fmt_date(date_str)}."
-                    )
-            return
-
-        # --- Talent sign-up ---
-        if emoji not in EMOJI_TO_ROLE:
-            return
-        match = self.db.get_match_by_broadcast_message(str(payload.message_id))
-        if not match or match.get("broadcast_accepted"):
-            return
-        guild = self.bot.get_guild(payload.guild_id)
-        if not guild:
-            return
-        try:
-            member = await guild.fetch_member(payload.user_id)
-        except discord.HTTPException:
-            return
-        role = EMOJI_TO_ROLE[emoji]
-        is_new = self.db.upsert_signup(
-            match_id=match["id"],
-            message_id=str(payload.message_id),
-            role=role,
-            user_id=str(payload.user_id),
-            username=str(member),
-            display_name=member.display_name,
-        )
-        if is_new:
-            await self._update_signup_message(match, str(payload.message_id))
-            await self._check_and_finalize_match(match, str(payload.message_id))
-
-    @commands.Cog.listener()
-    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
-        if payload.user_id == self.bot.user.id:
-            return
-        emoji = str(payload.emoji)
-        if emoji not in EMOJI_TO_ROLE:
-            return
-        broadcast_ch_id = self.db.get_config("broadcast_channel_id")
-        if not broadcast_ch_id or str(payload.channel_id) != broadcast_ch_id:
-            return
-        match = self.db.get_match_by_broadcast_message(str(payload.message_id))
-        if not match or match.get("broadcast_accepted"):
-            return
-        role = EMOJI_TO_ROLE[emoji]
-        removed = self.db.remove_signup(match["id"], role, str(payload.user_id))
-        if removed:
-            await self._update_signup_message(match, str(payload.message_id))
-
-    async def _update_signup_message(self, match: dict, message_id: str) -> None:
-        """Edit the sign-up message in the broadcast channel to reflect current signups."""
-        broadcast_ch = self._get_broadcast_channel()
-        if not broadcast_ch:
-            return
-        try:
-            msg = await broadcast_ch.fetch_message(int(message_id))
-            signups = self.db.get_signups_for_match(match["id"])
-            await msg.edit(content=build_signup_message(match, signups))
-        except Exception:
-            pass
-
-    async def _check_and_finalize_match(self, match: dict, message_id: str) -> None:
-        """If all required talent roles are filled, move match to the Accepted Calendar."""
-        signups = self.db.get_signups_for_match(match["id"])
-        if not is_fully_staffed(signups):
-            return
-        teamup = self.get_teamup()
-        if not teamup or not match.get("teamup_event_id"):
-            return
-        description = build_talent_description(signups)
-        title = (
-            f"[{match['division']}] {match['team_home']} vs {match['team_away']}"
-            f" {{{match['id']}}}"
-        )
-        end_ts = match["match_time"] + int(MATCH_DURATION_H * 3600)
-        try:
-            teamup.update_event(
-                match["teamup_event_id"], title, match["match_time"], end_ts,
-                subcalendar="accepted", description=description,
-            )
-        except Exception as e:
-            log.error("TeamUp update failed when finalizing match %s: %s", match["id"], e)
-            return
-        self.db.mark_broadcast_accepted(match["id"])
-        broadcast_ch = self._get_broadcast_channel()
-        if broadcast_ch:
-            try:
-                msg = await broadcast_ch.fetch_message(int(message_id))
-                confirmed_text = (
-                    build_signup_message(match, signups)
-                    + "\n\n✅ **All required talent confirmed — moved to Accepted Calendar!**"
-                )
-                await msg.edit(content=confirmed_text)
-            except Exception:
-                pass
-        log_ch = self._get_log_channel()
-        if log_ch:
-            await log_ch.send(
-                f"✅ **[{match['division']}] {match['team_home']} vs {match['team_away']}** "
-                f"fully staffed — moved to Accepted Calendar."
-            )
+    # ------------------------------------------------------------------
+    # No reaction handlers needed — proposals and confirmations use buttons
+    # ------------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
         channel_id = str(channel.id)
         match_ch = self.db.get_config("match_channel_id")
         broadcast_ch_id = self.db.get_config("broadcast_channel_id")
-        warning = (
-            "⚠️ A configured channel was deleted. "
-            "Use `/set-match-channel` or `/set-broadcast-channel` to reconfigure."
-        )
+        signup_ch_id = self.db.get_config("signup_channel_id")
+        log_ch = self._get_log_channel()
+
         if channel_id == match_ch:
             self.db.delete_config("match_channel_id")
-            remaining = self._get_broadcast_channel()
-            if remaining:
-                await remaining.send(warning)
+            notify = log_ch or self._get_broadcast_channel()
+            if notify:
+                await notify.send(
+                    "⚠️ The match channel was deleted. Use `/set-match-channel` to reconfigure."
+                )
         if channel_id == broadcast_ch_id:
             self.db.delete_config("broadcast_channel_id")
             log.warning("Broadcast channel %s deleted. No channel to send warning.", channel_id)
+            if log_ch:
+                await log_ch.send(
+                    "⚠️ The broadcast channel was deleted. "
+                    "Use `/set-broadcast-channel` to reconfigure."
+                )
+        if channel_id == signup_ch_id:
+            self.db.delete_config("signup_channel_id")
+            notify = log_ch or self._get_broadcast_channel()
+            if notify:
+                await notify.send(
+                    "⚠️ The sign-up channel was deleted. "
+                    "Use `/set-signup-channel` to reconfigure."
+                )

@@ -82,6 +82,7 @@ class TeamUpClient:
         start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         end_dt = datetime.fromtimestamp(end_ts, tz=timezone.utc)
         payload = {
+            "id": event_id,
             "title": title,
             "start_dt": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_dt": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),

@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from database import Database
-from scheduler import build_matches_announcement, MATCH_DURATION_H
+from scheduler import build_matches_announcement, match_end_ts
 from typing import Callable, Optional
 
 
@@ -16,6 +16,14 @@ class AdminCog(commands.Cog):
         if not interaction.guild:
             return False
         return interaction.user.guild_permissions.administrator
+
+    def _manager_check(self, interaction: discord.Interaction) -> bool:
+        """Passes for Discord administrators and users added via /add-manager."""
+        if not interaction.guild:
+            return False
+        if interaction.user.guild_permissions.administrator:
+            return True
+        return self.db.is_manager(str(interaction.user.id))
 
     @app_commands.command(name="set-match-channel",
                           description="Set the channel to watch for match posts")
@@ -44,8 +52,35 @@ class AdminCog(commands.Cog):
             "✅ Match channel unlinked.", ephemeral=True
         )
 
+    @app_commands.command(name="set-signup-channel",
+                          description="Set the channel where talent sign-up messages are posted")
+    async def set_signup_channel(self, interaction: discord.Interaction,
+                                  channel: discord.TextChannel):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.set_config("signup_channel_id", str(channel.id))
+        await interaction.response.send_message(
+            f"✅ Sign-up channel set to {channel.mention}", ephemeral=True
+        )
+
+    @app_commands.command(name="unset-signup-channel",
+                          description="Unlink the sign-up channel")
+    async def unset_signup_channel(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.delete_config("signup_channel_id")
+        await interaction.response.send_message(
+            "✅ Sign-up channel unlinked.", ephemeral=True
+        )
+
     @app_commands.command(name="set-broadcast-channel",
-                          description="Set the admin channel for drafts and flags")
+                          description="Set the channel for talent confirmation messages")
     async def set_broadcast_channel(self, interaction: discord.Interaction,
                                      channel: discord.TextChannel):
         if not self._admin_check(interaction):
@@ -137,6 +172,7 @@ class AdminCog(commands.Cog):
             )
             return
         match_ch = self.db.get_config("match_channel_id")
+        signup_ch = self.db.get_config("signup_channel_id")
         broadcast_ch = self.db.get_config("broadcast_channel_id")
         log_ch = self.db.get_config("log_channel_id")
         calendar_id = self.db.get_config("teamup_calendar_id")
@@ -148,6 +184,7 @@ class AdminCog(commands.Cog):
         lines = [
             "**Bot Status**",
             f"Match channel: {ch_str(match_ch)}",
+            f"Sign-up channel: {ch_str(signup_ch)}",
             f"Broadcast channel: {ch_str(broadcast_ch)}",
             f"Log channel: {ch_str(log_ch)}",
             f"TeamUp calendar: {'✅ Set' if calendar_id else '❌ Not set'}",
@@ -155,6 +192,7 @@ class AdminCog(commands.Cog):
         ]
         missing = []
         if not match_ch: missing.append("`/set-match-channel`")
+        if not signup_ch: missing.append("`/set-signup-channel`")
         if not broadcast_ch: missing.append("`/set-broadcast-channel`")
         if not calendar_id: missing.append("`/set-teamup-calendar`")
         if not api_key: missing.append("`/set-teamup-key`")
@@ -211,9 +249,9 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="accept-broadcast",
                           description="Accept a match for broadcast — moves it to Accepted Broadcasts calendar")
     async def accept_broadcast(self, interaction: discord.Interaction, match_id: int):
-        if not self._admin_check(interaction):
+        if not self._manager_check(interaction):
             await interaction.response.send_message(
-                "Administrator permission required.", ephemeral=True
+                "Manager or Administrator permission required.", ephemeral=True
             )
             return
         await interaction.response.defer(ephemeral=True)
@@ -230,7 +268,7 @@ class AdminCog(commands.Cog):
             return
         teamup = self.get_teamup() if self.get_teamup else None
         if teamup and match.get("teamup_event_id"):
-            end_ts = match["match_time"] + int(MATCH_DURATION_H * 3600)
+            end_ts = match_end_ts(match["match_time"])
             title = (
                 f"[{match['division']}] {match['team_home']} vs {match['team_away']}"
                 f" {{{match_id}}}"
@@ -256,17 +294,17 @@ class AdminCog(commands.Cog):
             )
             return
         await interaction.response.defer(ephemeral=True)
-        broadcast_ch_id = self.db.get_config("broadcast_channel_id")
-        if not broadcast_ch_id:
+        log_ch_id = self.db.get_config("log_channel_id")
+        if not log_ch_id:
             await interaction.followup.send(
-                "❌ Broadcast channel not configured.", ephemeral=True
+                "❌ Log channel not configured.", ephemeral=True
             )
             return
-        broadcast_ch = self.bot.get_channel(int(broadcast_ch_id))
+        log_ch = self.bot.get_channel(int(log_ch_id))
         msg = build_matches_announcement(self.db)
         if msg:
-            await broadcast_ch.send(msg)
-            await interaction.followup.send("✅ Announcement posted.", ephemeral=True)
+            await log_ch.send(msg)
+            await interaction.followup.send("✅ Announcement posted to log channel.", ephemeral=True)
         else:
             await interaction.followup.send(
                 "No upcoming matches logged to announce.", ephemeral=True
@@ -275,9 +313,9 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="broadcast-done",
                           description="Mark a match as broadcast-complete")
     async def broadcast_done(self, interaction: discord.Interaction, match_id: int):
-        if not self._admin_check(interaction):
+        if not self._manager_check(interaction):
             await interaction.response.send_message(
-                "Administrator permission required.", ephemeral=True
+                "Manager or Administrator permission required.", ephemeral=True
             )
             return
         match = self.db.get_match(match_id)
@@ -316,6 +354,59 @@ class AdminCog(commands.Cog):
         await events_cog._scan_match_history()
         await interaction.followup.send(
             "✅ History scan complete. Check the log channel for results.", ephemeral=True
+        )
+
+    @app_commands.command(name="set-timezone",
+                          description="Set your preferred timezone for time displays (e.g. in the New Match picker)")
+    async def set_timezone(self, interaction: discord.Interaction):
+        options = [
+            discord.SelectOption(label="ET — America/New_York",        value="America/New_York"),
+            discord.SelectOption(label="CT — America/Chicago",         value="America/Chicago"),
+            discord.SelectOption(label="MT — America/Denver",          value="America/Denver"),
+            discord.SelectOption(label="PT — America/Los_Angeles",     value="America/Los_Angeles"),
+            discord.SelectOption(label="AKT — America/Anchorage",      value="America/Anchorage"),
+            discord.SelectOption(label="HT — Pacific/Honolulu",        value="Pacific/Honolulu"),
+            discord.SelectOption(label="AT — America/Halifax",         value="America/Halifax"),
+            discord.SelectOption(label="NT — America/St_Johns",        value="America/St_Johns"),
+            discord.SelectOption(label="BRT — America/Sao_Paulo",      value="America/Sao_Paulo"),
+            discord.SelectOption(label="GMT — Europe/London",          value="Europe/London"),
+            discord.SelectOption(label="CET — Europe/Paris",           value="Europe/Paris"),
+            discord.SelectOption(label="EET — Europe/Helsinki",        value="Europe/Helsinki"),
+            discord.SelectOption(label="MSK — Europe/Moscow",          value="Europe/Moscow"),
+            discord.SelectOption(label="GST — Asia/Dubai",             value="Asia/Dubai"),
+            discord.SelectOption(label="PKT — Asia/Karachi",           value="Asia/Karachi"),
+            discord.SelectOption(label="IST — Asia/Kolkata",           value="Asia/Kolkata"),
+            discord.SelectOption(label="BST — Asia/Dhaka",             value="Asia/Dhaka"),
+            discord.SelectOption(label="ICT — Asia/Bangkok",           value="Asia/Bangkok"),
+            discord.SelectOption(label="CST — Asia/Shanghai",          value="Asia/Shanghai"),
+            discord.SelectOption(label="JST — Asia/Tokyo",             value="Asia/Tokyo"),
+            discord.SelectOption(label="AEST — Australia/Sydney",      value="Australia/Sydney"),
+            discord.SelectOption(label="NZST — Pacific/Auckland",      value="Pacific/Auckland"),
+            discord.SelectOption(label="UTC",                          value="UTC"),
+        ]
+
+        class _TZSelect(discord.ui.Select):
+            def __init__(self_inner):
+                super().__init__(
+                    placeholder="Select your timezone...",
+                    options=options,
+                    min_values=1,
+                    max_values=1,
+                )
+
+            async def callback(self_inner, tz_interaction: discord.Interaction):
+                chosen = self_inner.values[0]
+                tz_interaction.client.db.set_user_timezone(
+                    str(tz_interaction.user.id), chosen
+                )
+                await tz_interaction.response.edit_message(
+                    content=f"✅ Timezone set to **{chosen}**.", view=None
+                )
+
+        view = discord.ui.View(timeout=120)
+        view.add_item(_TZSelect())
+        await interaction.response.send_message(
+            "Select your preferred timezone:", view=view, ephemeral=True
         )
 
     @app_commands.command(name="reset",
@@ -357,4 +448,141 @@ class AdminCog(commands.Cog):
             summary += f" ({failed} deletion(s) failed — remove manually.)"
         await interaction.followup.send(
             f"✅ Bot has been reset to its original state.\n{summary}", ephemeral=True
+        )
+
+    # ------------------------------------------------------------------
+    # Manager management (admin-only)
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="add-manager",
+                          description="Grant broadcast manager permissions to a user")
+    async def add_manager(self, interaction: discord.Interaction,
+                          user: discord.Member):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.add_manager(
+            str(user.id), str(user), user.display_name,
+            added_by=str(interaction.user.id),
+        )
+        await interaction.response.send_message(
+            f"✅ {user.mention} added as broadcast manager.", ephemeral=True
+        )
+
+    @app_commands.command(name="remove-manager",
+                          description="Revoke broadcast manager permissions from a user")
+    async def remove_manager(self, interaction: discord.Interaction,
+                             user: discord.Member):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        removed = self.db.remove_manager(str(user.id))
+        if removed:
+            await interaction.response.send_message(
+                f"✅ {user.mention} removed as broadcast manager.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"⚠️ {user.mention} is not a manager.", ephemeral=True
+            )
+
+    @app_commands.command(name="list-managers",
+                          description="List all broadcast managers")
+    async def list_managers(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        managers = self.db.get_all_managers()
+        if not managers:
+            await interaction.response.send_message(
+                "No managers configured.", ephemeral=True
+            )
+            return
+        lines = ["**Broadcast Managers:**"]
+        for m in managers:
+            lines.append(f"  • {m['display_name']} ({m['username']}) — <@{m['user_id']}>")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # Talent leaderboard (managers + admins)
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="talent",
+                          description="List talent by broadcast count")
+    async def talent_list(self, interaction: discord.Interaction):
+        if not self._manager_check(interaction):
+            await interaction.response.send_message(
+                "Manager or Administrator permission required.", ephemeral=True
+            )
+            return
+        talent = self.db.get_all_talent()
+        if not talent:
+            await interaction.response.send_message(
+                "No talent records yet.", ephemeral=True
+            )
+            return
+        lines = ["**Talent Broadcast Counts:**"]
+        for i, t in enumerate(talent, 1):
+            lines.append(
+                f"  {i}. {t['display_name']} ({t['username']}) "
+                f"— **{t['broadcast_count']}** broadcast{'s' if t['broadcast_count'] != 1 else ''}"
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # New season reset (admin-only)
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="new-season",
+                          description="Reset season data (keeps channels, TeamUp config, and managers)")
+    async def new_season(self, interaction: discord.Interaction,
+                         confirm: bool = False):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        if not confirm:
+            await interaction.response.send_message(
+                "⚠️ This will reset all match history, team tallies, talent records, "
+                "and blocked days.\n"
+                "Channel settings, TeamUp config, and the manager list will be preserved.\n"
+                "Run `/new-season confirm:True` to proceed.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        teamup = self.get_teamup() if self.get_teamup else None
+        deleted, failed = 0, 0
+        if teamup:
+            for match in self.db.get_all_matches_with_teamup_id():
+                try:
+                    teamup.delete_event(match["teamup_event_id"])
+                    deleted += 1
+                except Exception:
+                    failed += 1
+            for day in self.db.get_all_blocked_days():
+                if day.get("teamup_event_id"):
+                    try:
+                        teamup.delete_event(day["teamup_event_id"])
+                        deleted += 1
+                    except Exception:
+                        failed += 1
+        self.db.reset_season()
+        summary = (
+            f"Removed {deleted} TeamUp event(s)."
+            if teamup else "TeamUp not configured — calendar events were not cleared."
+        )
+        if failed:
+            summary += f" ({failed} deletion(s) failed — remove manually.)"
+        await interaction.followup.send(
+            f"✅ New season started. Season data cleared.\n{summary}\n"
+            f"Channel settings, TeamUp config, and managers were preserved.",
+            ephemeral=True,
         )

@@ -109,3 +109,26 @@ def test_create_event_bad_response_shape_raises(client):
     with patch.object(client.session, "post", return_value=mock_response(200, {"unexpected": "data"})):
         with pytest.raises(TeamUpError):
             client.create_event("[Premier] A vs B", 1713657600, 1713664800)
+
+
+def test_update_event_includes_id_in_payload(client):
+    """Regression: TeamUp PUT requires 'id' in the request body (400 without it)."""
+    with patch.object(client.session, "put", return_value=mock_response(200, {})) as mock_put:
+        client.update_event("event-42", "[D1] A vs B", 1713657600, 1713664800)
+        payload = mock_put.call_args[1]["json"]
+        assert payload["id"] == "event-42"
+
+
+def test_update_event_routes_to_accepted_subcalendar(client):
+    with patch.object(client.session, "put", return_value=mock_response(200, {})) as mock_put:
+        client.update_event("event-1", "[D1] A vs B", 1713657600, 1713664800,
+                            subcalendar="accepted")
+        payload = mock_put.call_args[1]["json"]
+        assert payload["subcalendar_ids"] == [2]  # "Accepted Broadcasts" id
+
+
+def test_update_event_without_subcalendar_omits_subcalendar_ids(client):
+    with patch.object(client.session, "put", return_value=mock_response(200, {})) as mock_put:
+        client.update_event("event-1", "[D1] A vs B", 1713657600, 1713664800)
+        payload = mock_put.call_args[1]["json"]
+        assert "subcalendar_ids" not in payload
