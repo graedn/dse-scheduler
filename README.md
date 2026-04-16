@@ -182,9 +182,7 @@ Signing up for a role while marked Unavailable removes the Unavailable flag. Cli
 
 ## Talent Allocation
 
-When sign-ups close with a full crew, the bot posts a talent allocation message in the **log channel**. Managers use dropdown selects to assign each required role, then confirm.
-
-If an optional Host or Analysts signed up, a second step appears to select them.
+When sign-ups close with a full crew, the bot posts a talent allocation message in the **log channel**. Managers use dropdown selects to assign all roles in a single step — required roles (Producer, Observer, Play-by-Play, Colour Caster) plus optional Host and Analyst if anyone signed up for them — then confirm.
 
 Once confirmed, a **talent confirmation message** is sent to the **broadcast channel** listing the full crew. Each assigned person must click **Ready** to confirm. If anyone clicks **Reject**, the allocation resets and the process restarts.
 
@@ -227,12 +225,16 @@ When all required talent confirm:
 | `/broadcast-done <match-id>` | Mark a match as broadcast-complete outside of the bot's normal flow (increments team tallies). Not required for bot-managed broadcasts — the bot handles this automatically when talent confirms and the schedule is updated. Use only when a broadcast was completed outside of the bot's context. |
 | `/set-timezone` | Set your preferred timezone for time displays (e.g. New Match picker) |
 
-### Manager management *(Administrator for add/remove; Manager for list)*
+### Manager management *(Administrator for add/remove/role commands; Manager for list)*
 | Command | Description |
 |---|---|
-| `/add-manager @user` | Grant broadcast manager permissions (can use manager buttons/commands) |
-| `/remove-manager @user` | Revoke manager permissions |
+| `/add-manager-role @role` | Set the Discord role automatically assigned to managers (run this first) |
+| `/remove-manager-role` | Clear the configured manager role |
+| `/add-manager @user` | Grant broadcast manager permissions and assign the manager role |
+| `/remove-manager @user` | Revoke manager permissions and remove the manager role |
 | `/list-managers` | List all current managers |
+
+> **Note:** `/add-manager-role` must be configured before `/add-manager` or `/remove-manager` can be used. The bot requires **Manage Roles** permission and its role must be ranked above the manager role in the server's role hierarchy.
 
 ### Day blocking *(Manager)*
 | Command | Description |
