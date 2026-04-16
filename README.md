@@ -98,7 +98,7 @@ Proposals show the current vs. proposed schedule with four action buttons:
 - **Delete Events** — remove the proposed events from the calendar
 - **Block Day** — remove all events for the day and add a NO STREAM block
 
-If no action is taken, the proposal **auto-approves after 12 hours**.
+If no action is taken, the proposal **auto-approves after 12 hours** — but only if no talent has signed up for any match in the current schedule. If sign-ups exist, the proposal is held until a manager explicitly approves or rejects it.
 
 ### Pair window
 The bot only considers match combinations where consecutive matches are **exactly ~2 hours apart** (1.9–2.1h window). Combinations with wider gaps are never proposed.
@@ -142,6 +142,7 @@ When a match is confirmed to the calendar, the bot posts a sign-up message in th
 | Colour Caster | ✅ | Must be a unique person, different from PBP |
 | Host | Optional | |
 | Analyst | Optional | |
+| Unavailable | — | Marks you as unavailable for this match; removes any role sign-ups |
 
 ### Auto-trigger requirements
 Sign-ups are considered complete when:
@@ -165,10 +166,12 @@ If the crew is incomplete at deadline, the sign-up message is edited with a **LA
 
 | Status | When | Buttons |
 |--------|------|---------|
-| Active | Match is scheduled, sign-ups open | All role buttons + Force Schedule + New Match + Block Day |
+| Active | Match is scheduled, sign-ups open | All role buttons + Unavailable + Force Schedule + New Match + Block Day |
 | ❗❗ LAST CALL | Deadline passed, crew incomplete | Same |
 | ✅ APPROVED | All talent confirmed | New Match + Block Day only (shows allocated roster) |
 | ❌ CANCELLED | Cancelled by management or deadline missed | None |
+
+Signing up for a role while marked Unavailable removes the Unavailable flag. Clicking Unavailable while signed up for roles removes all role sign-ups. Each user's first interaction with a match (role or Unavailable) increments their response count.
 
 ### Sign-up message buttons (manager-only)
 - **Force Schedule** — bypass the deadline and trigger talent allocation immediately
@@ -192,9 +195,14 @@ When all required talent confirm:
 
 ---
 
-## Admin Commands
+## Commands
 
-### Configuration
+> **Permission levels**
+> - **Administrator** — Discord server administrator only
+> - **Manager** — server administrators and users added via `/add-manager`
+> - **Anyone** — no permission required
+
+### Configuration *(Administrator)*
 | Command | Description |
 |---|---|
 | `/set-match-channel #channel` | Set the channel to watch for match posts |
@@ -209,45 +217,52 @@ When all required talent confirm:
 | `/set-teamup-key <key>` | Set the TeamUp API key |
 | `/status` | Show current configuration and any missing settings |
 | `/test-teamup` | Test the TeamUp API connection |
-| `/set-timezone` | Set your personal timezone for time displays (e.g. New Match picker) |
 
-### Match management
+### Match management *(Manager)*
 | Command | Description |
 |---|---|
 | `/sync-history` | Scan the match channel history and log any future matches |
 | `/announce-matches` | Post the upcoming matches summary to the log channel now |
 | `/accept-broadcast <match-id>` | Manually move a match to the Accepted Calendar |
-| `/broadcast-done <match-id>` | Mark a match as broadcast-complete (increments team tallies) |
+| `/broadcast-done <match-id>` | Mark a match as broadcast-complete outside of the bot's normal flow (increments team tallies). Not required for bot-managed broadcasts — the bot handles this automatically when talent confirms and the schedule is updated. Use only when a broadcast was completed outside of the bot's context. |
+| `/set-timezone` | Set your preferred timezone for time displays (e.g. New Match picker) |
 
-### Manager management
+### Manager management *(Administrator for add/remove; Manager for list)*
 | Command | Description |
 |---|---|
 | `/add-manager @user` | Grant broadcast manager permissions (can use manager buttons/commands) |
 | `/remove-manager @user` | Revoke manager permissions |
 | `/list-managers` | List all current managers |
 
-### Day blocking
+### Day blocking *(Manager)*
 | Command | Description |
 |---|---|
 | `/block-day YYYY-MM-DD [reason]` | Block a day from scheduling — adds a NO STREAM event to TeamUp |
 | `/unblock-day YYYY-MM-DD` | Remove a block for a day |
 | `/list-blocks` | Show all blocked days |
 
-### Season reset
+### Season reset *(Administrator)*
 | Command | Description |
 |---|---|
 | `/new-season confirm:True` | Clear all match/sign-up/team data, reset IDs to 1 (preserves config and managers) |
 | `/reset confirm:True` | Erase all bot data including config, delete all TeamUp calendar events |
 
+### General *(Anyone)*
+| Command | Description |
+|---|---|
+| `/talent` | List talent by broadcast and response counts |
+
 ---
 
 ## After a Broadcast
 
-Once you've streamed a match:
+The bot handles broadcast completion automatically when all talent confirm via the confirmation message — team tallies are incremented and the TeamUp event is moved to the Accepted Calendar without any manual steps needed.
+
+`/broadcast-done` is only needed if a match was streamed **outside of the bot's normal flow** (e.g. the confirmation flow was skipped or the bot was offline):
 ```
 /broadcast-done <match-id>
 ```
-The match ID appears in the sign-up message and scheduling notifications. This increments the broadcast count for both teams so the algorithm deprioritises them in future selections.
+The match ID appears in the sign-up message and scheduling notifications.
 
 ---
 

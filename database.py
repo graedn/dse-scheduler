@@ -116,6 +116,29 @@ class Database:
             self.conn.commit()
         except Exception:
             pass  # Column already exists
+        # Migrate: allocation message tracking (so displaced allocations can be edited)
+        try:
+            self.conn.execute(
+                "ALTER TABLE talent_allocations ADD COLUMN allocation_message_id TEXT"
+            )
+            self.conn.commit()
+        except Exception:
+            pass
+        try:
+            self.conn.execute(
+                "ALTER TABLE talent_allocations ADD COLUMN allocation_channel_id TEXT"
+            )
+            self.conn.commit()
+        except Exception:
+            pass
+        # Migrate: response_count tracks how many matches a talent has responded to
+        try:
+            self.conn.execute(
+                "ALTER TABLE talent ADD COLUMN response_count INTEGER NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
+        except Exception:
+            pass
 
     def _et_day_range(self, date_str: str) -> tuple[int, int]:
         """Return (start_ts, end_ts) Unix seconds for date_str in Eastern Time."""
@@ -559,9 +582,21 @@ class Database:
         )
         self.conn.commit()
 
+    def increment_talent_response(self, user_id: str, username: str,
+                                   display_name: str) -> None:
+        """Increment response_count by 1. Inserts the row if it doesn't exist yet."""
+        self.conn.execute(
+            "INSERT INTO talent (user_id, username, display_name, broadcast_count, response_count) "
+            "VALUES (?, ?, ?, 0, 1) ON CONFLICT(user_id) DO UPDATE SET "
+            "response_count = response_count + 1, "
+            "username = excluded.username, display_name = excluded.display_name",
+            (user_id, username, display_name)
+        )
+        self.conn.commit()
+
     def get_all_talent(self) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT * FROM talent WHERE broadcast_count > 0 "
+            "SELECT * FROM talent WHERE broadcast_count > 0 OR response_count > 0 "
             "ORDER BY broadcast_count DESC, display_name ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -583,6 +618,16 @@ class Database:
             "SELECT * FROM talent_allocations WHERE match_id = ?", (match_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def set_allocation_message(self, match_id: int,
+                               message_id: str, channel_id: str) -> None:
+        """Store the Discord message ID of the allocation UI so it can be edited later."""
+        self.conn.execute(
+            "UPDATE talent_allocations SET allocation_message_id = ?, "
+            "allocation_channel_id = ?, updated_at = ? WHERE match_id = ?",
+            (message_id, channel_id, int(time.time()), match_id)
+        )
+        self.conn.commit()
 
     def get_allocation_by_confirmation_message(self,
                                                message_id: str) -> Optional[dict]:

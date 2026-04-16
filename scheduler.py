@@ -4,6 +4,9 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 import asyncio
 import json
+import logging
+
+log = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 
@@ -211,8 +214,11 @@ def build_signup_message(match: dict, signups: list[dict], last_call: bool = Fal
     deadline = match.get("signup_deadline")
 
     by_role: dict[str, list[dict]] = {r: [] for r in ROLE_EMOJIS}
+    unavailable: list[dict] = []
     for s in sorted(signups, key=lambda x: x["signed_up_at"]):
-        if s["role"] in by_role:
+        if s["role"] == "unavailable":
+            unavailable.append(s)
+        elif s["role"] in by_role:
             by_role[s["role"]].append(s)
 
     lines = [_SEPARATOR]
@@ -237,6 +243,9 @@ def build_signup_message(match: dict, signups: list[dict], last_call: bool = Fal
         else:
             names = "—"
         lines.append(f"**{label}{opt_tag}:** {names}")
+
+    unavailable_names = ", ".join(s["display_name"] for s in unavailable) if unavailable else "—"
+    lines.append(f"**Unavailable:** {unavailable_names}")
 
     lines += [
         "",
@@ -344,7 +353,7 @@ def build_proposal_message(date_str: str, current_combo: list[dict],
         f"**Proposed schedule:**\n{proposed_lines}\n\n"
         f"**Reason:** Proposed combination scores {proposed_score} vs current {current_score}.\n"
         f"Teams: {', '.join(team_info)}\n\n"
-        f"Auto-approves in 12 hours if no action is taken."
+        f"Auto-approves in 12 hours if no action is taken and there are no active sign-ups for the current schedule."
     )
 
 
@@ -471,8 +480,30 @@ async def apply_pending_change(change: dict, db, teamup,
 
 async def process_expired_changes(db, teamup, broadcast_channel,
                                    signup_channel=None) -> None:
-    """Auto-approve pending changes whose 12-hour window has passed."""
+    """Auto-approve pending changes whose 12-hour window has passed.
+
+    Skips auto-approval if any match in the current (displaced) schedule has
+    active sign-ups — avoids disrupting talent who have already signed up.
+    """
     for change in db.get_expired_pending_changes():
+        # Check whether any displaced match has sign-ups
+        old_event_ids: list[str] = json.loads(change.get("old_event_ids") or "[]")
+        has_signups = False
+        for event_id in old_event_ids:
+            for match in db.get_matches_by_teamup_event_id(event_id):
+                if db.get_signups_for_match(match["id"]):
+                    has_signups = True
+                    break
+            if has_signups:
+                break
+
+        if has_signups:
+            log.info(
+                "Skipping auto-approval for change %s — active sign-ups exist on displaced matches.",
+                change["id"],
+            )
+            continue
+
         date_str = await apply_pending_change(
             change, db, teamup, broadcast_channel, signup_channel=signup_channel
         )
