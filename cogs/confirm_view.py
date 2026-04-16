@@ -2,7 +2,7 @@ import discord
 import json
 import logging
 
-from scheduler import _SEPARATOR
+from scheduler import _SEPARATOR, _CALENDAR_LINK
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +64,7 @@ def build_confirmation_message(match: dict, role_assignments: dict,
         mentions = " ".join(f"<@{uid}>" for uid in awaiting)
         lines += ["", f"⏳ **Awaiting confirmation from:** {mentions}"]
 
+    lines += ["", _CALENDAR_LINK]
     return "\n".join(lines)
 
 

@@ -163,7 +163,9 @@ async def daily_sweep_job():
 
 GUILD_IDS = [
     1493650865238577172, # user server
-    1493657000922451989,  # admin server replace with your server ID(s)
+    1493657000922451989, # admin server
+    1396460856883155078, # test server 1
+    1214565847419457576, # test server 2
 ]
 
 @bot.event
@@ -197,8 +199,13 @@ async def on_ready():
     for guild_id in GUILD_IDS:
         guild = discord.Object(id=guild_id)
         bot.tree.copy_global_to(guild=guild)
-        await bot.tree.sync(guild=guild)
-        print(f"Slash commands synced to guild {guild_id}.")
+        try:
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Slash commands synced to guild {guild_id}: {len(synced)} command(s).")
+        except discord.Forbidden:
+            print(f"ERROR: Missing 'applications.commands' scope in guild {guild_id}.")
+        except discord.HTTPException as e:
+            print(f"ERROR syncing to guild {guild_id}: {e}")
     bot.tree.clear_commands(guild=None)
     await bot.tree.sync()
     if not scheduler.running:

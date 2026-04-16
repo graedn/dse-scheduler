@@ -198,6 +198,7 @@ def _fmt_date(date_str: str) -> str:
 # --- Talent sign-up helpers ---
 
 _SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+_CALENDAR_LINK = "[View Calendar](https://teamup.com/ksb1114dr63p4yb3gr)"
 
 # Per-date lock to prevent concurrent schedule_for_date calls from racing
 _date_locks: dict[str, asyncio.Lock] = {}
@@ -241,6 +242,8 @@ def build_signup_message(match: dict, signups: list[dict], last_call: bool = Fal
         "",
         "*Click a role button to sign up or withdraw.*",
         "*Managers: use the **Force Schedule** button to trigger immediate talent allocation.*",
+        "",
+        _CALENDAR_LINK,
     ]
     return "\n".join(lines)
 
@@ -276,6 +279,7 @@ def build_approved_signup_message(match: dict, role_assignments: dict) -> str:
         uid = assignment["user_id"]
         name = assignment["display_name"]
         lines.append(f"**{label}:** <@{uid}> — {name}")
+    lines += ["", _CALENDAR_LINK]
     return "\n".join(lines)
 
 
