@@ -22,7 +22,7 @@ cogs/
   blocks.py          — /block-day, /unblock-day, /list-blocks
   events.py          — on_message (match parsing and scheduling)
   talent.py          — AllocationView (single-step: 4 role selects + optional + Confirm/Cancel)
-  signup.py          — SignUpView (role buttons + Force Schedule + New Match + Block Day)
+  signup.py          — SignUpView (role buttons + Unavailable + Force Schedule + New Match + Block Day)
   proposal.py        — ProposalView (Approve / Reject / Delete Events / Block Day buttons)
   confirm_view.py    — ConfirmationView (Ready / Reject buttons for per-talent confirmation)
 ```
@@ -46,7 +46,7 @@ cogs/
 - **Call time is 30 minutes before match** — if crew is still incomplete at call time, the match is cancelled.
 - **`is_fully_staffed`** requires all 4 required roles filled + PBP ≠ Colour + ≥ 3 unique users. Producer/Observer may share a person.
 - **Force Schedule** (formerly Force Start) on the sign-up view bypasses `is_fully_staffed` and triggers allocation immediately.
-- **Proposals and pending changes** are stored in `pending_changes` table; 12-hour auto-approve window.
+- **Proposals and pending changes** are stored in `pending_changes` table; 12-hour auto-approve window **only if no displaced match has active sign-ups** — `process_expired_changes` checks `get_signups_for_match` for each old event before applying. Manager can always approve manually regardless of sign-ups.
 - **`get_teamup()`** creates a new `TeamUpClient` instance each call (reads config from DB).
 - **Persistent views** are re-registered on bot startup: `SignUpView`, `ProposalView`, `ConfirmationView`. Allocation views are NOT persistent — managers use Force Schedule to re-trigger after a restart.
 - **TeamUp PUT requires `"id"` in the request body** (see `teamup.py update_event`).
@@ -56,6 +56,10 @@ cogs/
 - **New Match button** skips the pending-proposals check for accepted matches (emergency swap). Scopes the check to the day via `get_pending_changes_for_date`, not globally.
 - **Sign-up message states**: Active → LAST CALL (deadline missed, crew incomplete) → APPROVED (all talent confirmed, view replaced with `ApprovedSignUpView`) → CANCELLED (management cancel or call-time miss). Each state transition edits the message in-place.
 - **Approved match swap (New Match on APPROVED)**: edits sign-up to CANCELLED with talent @mentions, edits the talent confirmation message to show replacement, sends a ping in the signup channel, then schedules the new match normally.
+- **Unavailable button** (red, row 1 of sign-up view): marks user as unavailable for that match; removes all role sign-ups when clicked. Clicking a role while unavailable removes the unavailable flag. First interaction with a match (role or unavailable) increments `response_count` in the `talent` table.
+- **Sign-up button row layout**: Row 0 — Producer/Observer/Play-by-Play/Colour Caster (blue). Row 1 — Host (green) / Analyst (green) / Unavailable (red). Row 2 — Force Schedule (green) / New Match (grey) / Block Day (red).
+- **Command permission levels**: Configuration commands (`/set-*`, `/unset-*`, `/status`, `/test-teamup`) → Administrator. Match management (`/sync-history`, `/announce-matches`, `/accept-broadcast`, `/broadcast-done`, `/set-timezone`) → Manager. Manager management (`/add-manager`, `/remove-manager`) → Administrator; `/list-managers` → Manager. Day blocking (`/block-day`, `/unblock-day`, `/list-blocks`) → Manager. Season reset (`/new-season`, `/reset`) → Administrator. `/talent` → any user.
+- **`/broadcast-done`** is not required for bot-managed broadcasts — the bot increments team tallies automatically when all talent confirm. Use only for broadcasts completed outside of the bot's normal flow.
 
 ## Running the Bot
 

@@ -48,6 +48,9 @@ class _ApproveButton(discord.ui.Button):
             )
             if old_info:
                 await _edit_old_signup_messages(old_info, interaction.client, new_matches=new_matches)
+            # Cancel any active talent allocations for displaced matches
+            log_ch = _get_channel(interaction.client, db, "log_channel_id")
+            await _cancel_displaced_allocations(old_info, db, interaction.client, log_ch)
         except Exception as e:
             log.exception("Error applying pending change %s", self.change_id)
             log_ch = _get_channel(interaction.client, db, "log_channel_id")
@@ -327,3 +330,59 @@ async def _edit_old_signup_messages(old_info: list[dict], bot,
                 await ch.send(ping_text)
         except Exception as e:
             log.warning("Failed to edit old sign-up message for match %s: %s", match["id"], e)
+
+
+async def _cancel_displaced_allocations(old_info: list[dict], db, bot, log_ch) -> None:
+    """For each displaced match that has an active talent allocation, cancel it and
+    edit the allocation message in the log channel to prevent stale confirmations."""
+    from scheduler import _SEPARATOR
+
+    _ACTIVE_STATUSES = {"pending", "sent", "last_call"}
+
+    for item in old_info:
+        match = item["match"]
+        alloc = db.get_allocation(match["id"])
+        if not alloc or alloc.get("status") not in _ACTIVE_STATUSES:
+            continue
+
+        # Mark cancelled so _ConfirmButton's guard also blocks it
+        db.set_allocation_status(match["id"], "cancelled")
+
+        alloc_msg_id = alloc.get("allocation_message_id")
+        alloc_ch_id  = alloc.get("allocation_channel_id")
+        if not alloc_msg_id or not alloc_ch_id:
+            # Message ID not stored (pre-migration allocation) — just send a notice
+            if log_ch:
+                ts = match["match_time"]
+                try:
+                    await log_ch.send(
+                        f"{_SEPARATOR}\n"
+                        f"❌ **Talent allocation cancelled**\n"
+                        f"**[{match['division']}] {match['team_home']} vs {match['team_away']}**"
+                        f" | <t:{ts}:F>\n\n"
+                        f"This match was removed from the broadcast schedule by a proposal approval."
+                    )
+                except Exception as e:
+                    log.warning("Failed to send allocation cancel notice for match %s: %s",
+                                match["id"], e)
+            continue
+
+        # Edit the original allocation message
+        ch = bot.get_channel(int(alloc_ch_id))
+        if not ch:
+            continue
+        ts = match["match_time"]
+        try:
+            msg = await ch.fetch_message(int(alloc_msg_id))
+            await msg.edit(
+                content=(
+                    f"{_SEPARATOR}\n"
+                    f"❌ **Talent Allocation Cancelled**\n"
+                    f"**[{match['division']}] {match['team_home']} vs {match['team_away']}**"
+                    f" | <t:{ts}:F>\n\n"
+                    f"This match was removed from the broadcast schedule by a proposal approval."
+                ),
+                view=discord.ui.View(),
+            )
+        except Exception as e:
+            log.warning("Failed to edit allocation message for match %s: %s", match["id"], e)

@@ -181,6 +181,17 @@ class _ConfirmButton(discord.ui.Button):
 
         view = self.view
 
+        # Guard: if the match was removed from the calendar by a schedule change,
+        # the allocation is no longer valid — reject before doing anything.
+        fresh_match = view.db.get_match(view.match["id"])
+        if not fresh_match or not fresh_match.get("teamup_event_id"):
+            await interaction.response.send_message(
+                "❌ This match is no longer on the broadcast schedule — "
+                "the allocation has been cancelled.",
+                ephemeral=True,
+            )
+            return
+
         # Validate required roles
         missing = [r for r in ROLE_ORDER if r not in view.selections
                    and r not in ("pbp", "colour")]  # casters validated separately
@@ -474,6 +485,7 @@ async def send_allocation_request(db: Database, match: dict,
 
     view = AllocationView(match, signups, db, broadcast_channel, log_channel, get_teamup)
     try:
-        await log_channel.send(text, view=view)
+        msg = await log_channel.send(text, view=view)
+        db.set_allocation_message(match["id"], str(msg.id), str(log_channel.id))
     except Exception as e:
         log.error("Failed to send allocation request for match %s: %s", match["id"], e)

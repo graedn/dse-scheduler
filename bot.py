@@ -1,5 +1,6 @@
 import os
 import asyncio
+import logging
 import discord
 from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -8,13 +9,18 @@ from zoneinfo import ZoneInfo
 
 from database import Database
 from teamup import TeamUpClient
-from scheduler import run_daily_sweep, run_morning_check, build_matches_announcement
+from scheduler import (
+    run_daily_sweep, run_morning_check, build_matches_announcement,
+    build_signup_message, is_fully_staffed, _SEPARATOR,
+)
 from cogs.admin import AdminCog
 from cogs.blocks import BlocksCog
 from cogs.events import EventsCog
+from cogs.talent import send_allocation_request
 
 load_dotenv()
 ET = ZoneInfo("America/New_York")
+log = logging.getLogger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -42,12 +48,15 @@ bot.get_teamup = get_teamup
 async def announce_job():
     log_ch_id = db.get_config("log_channel_id")
     log_ch = bot.get_channel(int(log_ch_id)) if log_ch_id else None
-    if log_ch:
+    if not log_ch:
+        print("[announce] Skipped — log channel not configured.")
+        return
+    try:
         msg = build_matches_announcement(db)
         if msg:
             await log_ch.send(msg)
-    else:
-        print("[announce] Skipped — log channel not configured.")
+    except Exception as e:
+        log.error("[announce] Failed to post matches announcement: %s", e)
 
 
 async def morning_job():
@@ -64,10 +73,6 @@ async def morning_job():
 
 async def deadline_check_job():
     """Every 5 min: handle sign-up deadlines and call-time cancellations."""
-    import logging
-    log = logging.getLogger(__name__)
-    from cogs.talent import send_allocation_request
-    from scheduler import build_signup_message, is_fully_staffed, _SEPARATOR
     log_ch_id = db.get_config("log_channel_id")
     broadcast_ch_id = db.get_config("broadcast_channel_id")
     signup_ch_id = db.get_config("signup_channel_id")
@@ -143,10 +148,14 @@ async def deadline_check_job():
                             match["id"], e)
 
         if log_ch:
-            await log_ch.send(
-                f"❌ **[{match['division']}] {match['team_home']} vs {match['team_away']}** — "
-                f"broadcast cancelled: required roles were not filled by call time."
-            )
+            try:
+                await log_ch.send(
+                    f"❌ **[{match['division']}] {match['team_home']} vs {match['team_away']}** — "
+                    f"broadcast cancelled: required roles were not filled by call time."
+                )
+            except Exception as e:
+                log.error("Cancel: failed to send log message for match %s: %s",
+                          match["id"], e)
 
 
 async def daily_sweep_job():

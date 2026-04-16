@@ -288,9 +288,9 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="announce-matches",
                           description="Post the logged matches summary to the broadcast channel now")
     async def announce_matches_cmd(self, interaction: discord.Interaction):
-        if not self._admin_check(interaction):
+        if not self._manager_check(interaction):
             await interaction.response.send_message(
-                "Administrator permission required.", ephemeral=True
+                "Manager or Administrator permission required.", ephemeral=True
             )
             return
         await interaction.response.defer(ephemeral=True)
@@ -341,9 +341,9 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="sync-history",
                           description="Scan the match channel history and log any future matches")
     async def sync_history(self, interaction: discord.Interaction):
-        if not self._admin_check(interaction):
+        if not self._manager_check(interaction):
             await interaction.response.send_message(
-                "Administrator permission required.", ephemeral=True
+                "Manager or Administrator permission required.", ephemeral=True
             )
             return
         await interaction.response.defer(ephemeral=True)
@@ -359,6 +359,11 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="set-timezone",
                           description="Set your preferred timezone for time displays (e.g. in the New Match picker)")
     async def set_timezone(self, interaction: discord.Interaction):
+        if not self._manager_check(interaction):
+            await interaction.response.send_message(
+                "Manager or Administrator permission required.", ephemeral=True
+            )
+            return
         options = [
             discord.SelectOption(label="ET — America/New_York",        value="America/New_York"),
             discord.SelectOption(label="CT — America/Chicago",         value="America/Chicago"),
@@ -493,9 +498,9 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="list-managers",
                           description="List all broadcast managers")
     async def list_managers(self, interaction: discord.Interaction):
-        if not self._admin_check(interaction):
+        if not self._manager_check(interaction):
             await interaction.response.send_message(
-                "Administrator permission required.", ephemeral=True
+                "Manager or Administrator permission required.", ephemeral=True
             )
             return
         managers = self.db.get_all_managers()
@@ -516,11 +521,6 @@ class AdminCog(commands.Cog):
     @app_commands.command(name="talent",
                           description="List talent by broadcast count")
     async def talent_list(self, interaction: discord.Interaction):
-        if not self._manager_check(interaction):
-            await interaction.response.send_message(
-                "Manager or Administrator permission required.", ephemeral=True
-            )
-            return
         talent = self.db.get_all_talent()
         if not talent:
             await interaction.response.send_message(
@@ -529,9 +529,12 @@ class AdminCog(commands.Cog):
             return
         lines = ["**Talent Broadcast Counts:**"]
         for i, t in enumerate(talent, 1):
+            bc = t['broadcast_count']
+            rc = t.get('response_count', 0)
             lines.append(
                 f"  {i}. {t['display_name']} ({t['username']}) "
-                f"— **{t['broadcast_count']}** broadcast{'s' if t['broadcast_count'] != 1 else ''}"
+                f"— **{bc}** broadcast{'s' if bc != 1 else ''}"
+                f" - **{rc}** Response{'s' if rc != 1 else ''}"
             )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 

@@ -9,14 +9,14 @@ from scheduler import REQUIRED_ROLES, _SEPARATOR, _fmt_date
 log = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
-# Role definitions in display order: (role_key, label, required, row)
+# Role definitions in display order: (role_key, label, required, row, style)
 _ROLE_DEFS = [
-    ("producer", "Producer",      True,  0),
-    ("observer", "Observer",      True,  0),
-    ("pbp",      "Play-by-Play",  True,  0),
-    ("colour",   "Colour Caster", True,  0),
-    ("host",     "Host",          False, 1),
-    ("analyst",  "Analyst",       False, 1),
+    ("producer", "Producer",      True,  0, discord.ButtonStyle.primary),
+    ("observer", "Observer",      True,  0, discord.ButtonStyle.primary),
+    ("pbp",      "Play-by-Play",  True,  0, discord.ButtonStyle.primary),
+    ("colour",   "Colour Caster", True,  0, discord.ButtonStyle.primary),
+    ("host",     "Host",          False, 1, discord.ButtonStyle.success),
+    ("analyst",  "Analyst",       False, 1, discord.ButtonStyle.success),
 ]
 
 
@@ -38,12 +38,13 @@ def _get_effective_signup_ch(db, bot):
 # ---------------------------------------------------------------------------
 
 class SignUpButton(discord.ui.Button):
-    def __init__(self, role: str, label: str, match_id: int, required: bool, row: int):
+    def __init__(self, role: str, label: str, match_id: int, required: bool, row: int,
+                 style: discord.ButtonStyle = discord.ButtonStyle.primary):
         self.role = role
         self.match_id = match_id
         super().__init__(
             label=label,
-            style=discord.ButtonStyle.primary if required else discord.ButtonStyle.danger,
+            style=style,
             custom_id=f"signup_{role}_{match_id}",
             row=row,
         )
@@ -73,17 +74,90 @@ class SignUpButton(discord.ui.Button):
         display_name = member.display_name
 
         signups = db.get_signups_for_match(self.match_id)
-        already_mine = any(
-            s["user_id"] == user_id and s["role"] == self.role for s in signups
-        )
+        user_signups = [s for s in signups if s["user_id"] == user_id]
+        already_mine = any(s["role"] == self.role for s in user_signups)
+
+        # First interaction with this match → count as a response
+        if not user_signups:
+            db.increment_talent_response(user_id, username, display_name)
 
         if already_mine:
             db.remove_signup(self.match_id, self.role, user_id)
         else:
+            # Remove "unavailable" if switching to a role
+            db.remove_signup(self.match_id, "unavailable", user_id)
             db.upsert_signup(
                 match_id=self.match_id,
                 message_id=str(interaction.message.id),
                 role=self.role,
+                user_id=user_id,
+                username=username,
+                display_name=display_name,
+            )
+
+        from scheduler import build_signup_message
+        fresh_match = db.get_match(self.match_id) or match
+        fresh_signups = db.get_signups_for_match(self.match_id)
+        new_content = build_signup_message(fresh_match, fresh_signups)
+        await interaction.response.edit_message(content=new_content, view=self.view)
+
+
+# ---------------------------------------------------------------------------
+# Unavailable button
+# ---------------------------------------------------------------------------
+
+class UnavailableButton(discord.ui.Button):
+    def __init__(self, match_id: int):
+        self.match_id = match_id
+        super().__init__(
+            label="Unavailable",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"signup_unavailable_{match_id}",
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        db = interaction.client.db
+        match = db.get_match(self.match_id)
+        if not match or match.get("broadcast_accepted"):
+            await interaction.response.send_message(
+                "This match is no longer accepting sign-ups.", ephemeral=True
+            )
+            return
+
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "Must be used in a server.", ephemeral=True
+            )
+            return
+
+        try:
+            member = await interaction.guild.fetch_member(int(interaction.user.id))
+        except discord.HTTPException:
+            member = interaction.user
+
+        user_id = str(interaction.user.id)
+        username = str(member)
+        display_name = member.display_name
+
+        signups = db.get_signups_for_match(self.match_id)
+        user_signups = [s for s in signups if s["user_id"] == user_id]
+        already_unavailable = any(s["role"] == "unavailable" for s in user_signups)
+
+        # First interaction with this match → count as a response
+        if not user_signups:
+            db.increment_talent_response(user_id, username, display_name)
+
+        # Remove all existing signups for this user (roles + unavailable)
+        for s in user_signups:
+            db.remove_signup(self.match_id, s["role"], user_id)
+
+        # Toggle: if not already unavailable, mark unavailable
+        if not already_unavailable:
+            db.upsert_signup(
+                match_id=self.match_id,
+                message_id=str(interaction.message.id),
+                role="unavailable",
                 user_id=user_id,
                 username=username,
                 display_name=display_name,
@@ -108,7 +182,7 @@ class ForceStartButton(discord.ui.Button):
             style=discord.ButtonStyle.success,
             custom_id=f"force_start_{match_id}",
             emoji="🟢",
-            row=1,
+            row=2,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -547,11 +621,12 @@ class BlockDayButton(discord.ui.Button):
 class SignUpView(discord.ui.View):
     def __init__(self, match_id: int):
         super().__init__(timeout=None)  # persistent
-        for role, label, required, row in _ROLE_DEFS:
+        for role, label, required, row, style in _ROLE_DEFS:
             self.add_item(SignUpButton(
                 role=role, label=label, match_id=match_id,
-                required=required, row=row,
+                required=required, row=row, style=style,
             ))
+        self.add_item(UnavailableButton(match_id))
         self.add_item(ForceStartButton(match_id))
         self.add_item(NewMatchButton(match_id))
         self.add_item(BlockDayButton(match_id))
