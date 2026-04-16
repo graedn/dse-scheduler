@@ -459,6 +459,42 @@ class AdminCog(commands.Cog):
     # Manager management (admin-only)
     # ------------------------------------------------------------------
 
+    @app_commands.command(name="add-manager-role",
+                          description="Set the Discord role automatically assigned to broadcast managers")
+    async def add_manager_role(self, interaction: discord.Interaction,
+                               role: discord.Role):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.set_config("manager_role_id", str(role.id))
+        await interaction.response.send_message(
+            f"✅ Manager role set to **{role.name}**. "
+            f"This role will be added/removed automatically when using `/add-manager` and `/remove-manager`.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="remove-manager-role",
+                          description="Clear the Discord role assigned to broadcast managers")
+    async def remove_manager_role(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        existing = self.db.get_config("manager_role_id")
+        if not existing:
+            await interaction.response.send_message(
+                "No manager role is configured.", ephemeral=True
+            )
+            return
+        self.db.delete_config("manager_role_id")
+        await interaction.response.send_message(
+            "✅ Manager role cleared. `/add-manager` and `/remove-manager` will no longer touch Discord roles.",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="add-manager",
                           description="Grant broadcast manager permissions to a user")
     async def add_manager(self, interaction: discord.Interaction,
@@ -468,12 +504,43 @@ class AdminCog(commands.Cog):
                 "Administrator permission required.", ephemeral=True
             )
             return
+
+        role_id = self.db.get_config("manager_role_id")
+        if not role_id:
+            await interaction.response.send_message(
+                "⚠️ No manager role configured. Run `/add-manager-role` first to set a Discord role "
+                "before adding managers.",
+                ephemeral=True,
+            )
+            return
+
+        role = interaction.guild.get_role(int(role_id))
+        if not role:
+            await interaction.response.send_message(
+                "⚠️ The configured manager role no longer exists in this server. "
+                "Run `/add-manager-role` to set a new one.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
         self.db.add_manager(
             str(user.id), str(user), user.display_name,
             added_by=str(interaction.user.id),
         )
-        await interaction.response.send_message(
-            f"✅ {user.mention} added as broadcast manager.", ephemeral=True
+        try:
+            await user.add_roles(role, reason=f"Added as broadcast manager by {interaction.user}")
+        except discord.Forbidden:
+            await interaction.followup.send(
+                f"✅ {user.mention} added as broadcast manager, but the bot lacks permission "
+                f"to assign the **{role.name}** role — grant it 'Manage Roles' and ensure the "
+                f"role is below the bot's highest role.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"✅ {user.mention} added as broadcast manager and given the **{role.name}** role.",
+            ephemeral=True,
         )
 
     @app_commands.command(name="remove-manager",
@@ -485,15 +552,47 @@ class AdminCog(commands.Cog):
                 "Administrator permission required.", ephemeral=True
             )
             return
-        removed = self.db.remove_manager(str(user.id))
-        if removed:
+
+        role_id = self.db.get_config("manager_role_id")
+        if not role_id:
             await interaction.response.send_message(
-                f"✅ {user.mention} removed as broadcast manager.", ephemeral=True
+                "⚠️ No manager role configured. Run `/add-manager-role` first to set a Discord role "
+                "before removing managers.",
+                ephemeral=True,
             )
-        else:
+            return
+
+        role = interaction.guild.get_role(int(role_id))
+        if not role:
+            await interaction.response.send_message(
+                "⚠️ The configured manager role no longer exists in this server. "
+                "Run `/add-manager-role` to set a new one.",
+                ephemeral=True,
+            )
+            return
+
+        removed = self.db.remove_manager(str(user.id))
+        if not removed:
             await interaction.response.send_message(
                 f"⚠️ {user.mention} is not a manager.", ephemeral=True
             )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await user.remove_roles(role, reason=f"Removed as broadcast manager by {interaction.user}")
+        except discord.Forbidden:
+            await interaction.followup.send(
+                f"✅ {user.mention} removed as broadcast manager, but the bot lacks permission "
+                f"to remove the **{role.name}** role — grant it 'Manage Roles' and ensure the "
+                f"role is below the bot's highest role.",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            f"✅ {user.mention} removed as broadcast manager and the **{role.name}** role was revoked.",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="list-managers",
                           description="List all broadcast managers")
