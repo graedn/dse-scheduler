@@ -583,3 +583,109 @@ def test_get_matches_past_calltime_last_call_ignores_future(db):
     db.set_allocation_status(mid, "last_call")
     results = db.get_matches_past_calltime_last_call()
     assert not any(r["id"] == mid for r in results)
+
+
+# --- thread_messages ---
+
+def test_insert_and_get_thread_message(db):
+    mid = db.insert_match("Premier", "W1", "A", "B", 1700000000, 1699990000)
+    db.insert_thread_message(mid, "thread-1", "ch-1", "role-1", "role-2", 0, 0)
+    row = db.get_thread_message(mid)
+    assert row is not None
+    assert row["thread_id"] == "thread-1"
+    assert row["team1_role_id"] == "role-1"
+    assert row["team2_role_id"] == "role-2"
+    assert row["team1_low_confidence"] == 0
+
+
+def test_get_thread_message_missing_returns_none(db):
+    assert db.get_thread_message(9999) is None
+
+
+def test_get_thread_by_id(db):
+    mid = db.insert_match("Premier", "W1", "A", "B", 1700000000, 1699990000)
+    db.insert_thread_message(mid, "thread-99", "ch-1", None, None, 1, 1)
+    row = db.get_thread_by_id("thread-99")
+    assert row is not None
+    assert row["match_id"] == mid
+
+
+def test_update_thread_roles(db):
+    mid = db.insert_match("Premier", "W1", "A", "B", 1700000000, 1699990000)
+    db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 1, 1)
+    db.update_thread_roles(mid, "new-role-1", "new-role-2", 0, 0)
+    row = db.get_thread_message(mid)
+    assert row["team1_role_id"] == "new-role-1"
+    assert row["team1_low_confidence"] == 0
+
+
+def test_set_thread_ready_check_message(db):
+    mid = db.insert_match("Premier", "W1", "A", "B", 1700000000, 1699990000)
+    db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 0, 0)
+    db.set_thread_ready_check_message(mid, "msg-rc-1")
+    row = db.get_thread_message(mid)
+    assert row["ready_check_message_id"] == "msg-rc-1"
+
+
+def test_set_and_get_thread_ready_check_response(db):
+    mid = db.insert_match("Premier", "W1", "A", "B", 1700000000, 1699990000)
+    db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 0, 0)
+    db.set_thread_ready_check_response(mid, "uid-1", True)
+    db.set_thread_ready_check_response(mid, "uid-2", False)
+    responses = db.get_thread_ready_check_responses(mid)
+    assert responses["uid-1"] is True
+    assert responses["uid-2"] is False
+
+
+def test_get_approved_matches_needing_ready_check(db):
+    import time as _time
+    # Match within 30 min, accepted, has thread, no ready check yet
+    soon_ts = int(_time.time()) + 1500  # 25 min from now
+    mid = db.insert_match("Premier", "W1", "A", "B", soon_ts, soon_ts - 3600)
+    db.mark_broadcast_accepted(mid)
+    db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 0, 0)
+    results = db.get_approved_matches_needing_ready_check()
+    assert any(r["id"] == mid for r in results)
+
+
+def test_get_approved_matches_needing_ready_check_excludes_already_sent(db):
+    import time as _time
+    soon_ts = int(_time.time()) + 1500
+    mid = db.insert_match("Premier", "W1", "C", "D", soon_ts, soon_ts - 3600)
+    db.mark_broadcast_accepted(mid)
+    db.insert_thread_message(mid, "thread-2", "ch-1", None, None, 0, 0)
+    db.set_thread_ready_check_message(mid, "msg-already-sent")
+    results = db.get_approved_matches_needing_ready_check()
+    assert not any(r["id"] == mid for r in results)
+
+
+def test_get_approved_matches_needing_ready_check_excludes_far_future(db):
+    import time as _time
+    far_ts = int(_time.time()) + 7200  # 2 hours away — beyond 30-min window
+    mid = db.insert_match("Premier", "W1", "E", "F", far_ts, far_ts - 3600)
+    db.mark_broadcast_accepted(mid)
+    db.insert_thread_message(mid, "thread-3", "ch-1", None, None, 0, 0)
+    results = db.get_approved_matches_needing_ready_check()
+    assert not any(r["id"] == mid for r in results)
+
+
+def test_get_all_threads_with_pending_ready_check(db):
+    mid = db.insert_match("Premier", "W1", "A", "B", 1700000000, 1699990000)
+    db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 0, 0)
+    db.set_thread_ready_check_message(mid, "msg-rc-1")
+    rows = db.get_all_threads_with_pending_ready_check()
+    assert any(r["match_id"] == mid for r in rows)
+
+
+def test_reset_season_clears_thread_messages(db):
+    mid = db.insert_match("Premier", "W1", "A", "B", 1700000000, 1699990000)
+    db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 0, 0)
+    db.reset_season()
+    assert db.get_thread_message(mid) is None
+
+
+def test_reset_all_clears_thread_messages(db):
+    mid = db.insert_match("Premier", "W1", "A", "B", 1700000000, 1699990000)
+    db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 0, 0)
+    db.reset_all()
+    assert db.get_thread_message(mid) is None

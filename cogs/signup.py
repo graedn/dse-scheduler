@@ -662,8 +662,10 @@ class SignUpView(discord.ui.View):
 
 class ApprovedSignUpView(discord.ui.View):
     """Persistent view shown on sign-up messages after talent confirmation is complete.
-    Only New Match and Block Day remain active."""
+    Only New Match, Block Day, and Create Thread remain active."""
     def __init__(self, match_id: int):
+        from cogs.threads import CreateThreadButton
         super().__init__(timeout=None)
         self.add_item(NewMatchButton(match_id))
         self.add_item(BlockDayButton(match_id))
+        self.add_item(CreateThreadButton(match_id))
