@@ -95,11 +95,39 @@ class SignUpButton(discord.ui.Button):
                 display_name=display_name,
             )
 
-        from scheduler import build_signup_message
+        from scheduler import build_signup_message, is_fully_staffed
         fresh_match = db.get_match(self.match_id) or match
         fresh_signups = db.get_signups_for_match(self.match_id)
-        new_content = build_signup_message(fresh_match, fresh_signups)
+
+        talent_role_id = db.get_config("talent_role_id")
+        talent_role_mention = f"<@&{talent_role_id}>" if talent_role_id else ""
+        new_content = build_signup_message(fresh_match, fresh_signups,
+                                           talent_role_mention=talent_role_mention)
         await interaction.response.edit_message(content=new_content, view=self.view)
+
+        # Check if minimum criteria just became met for the first time
+        alloc = db.get_allocation(self.match_id)
+        if alloc and alloc["status"] == "pending" and is_fully_staffed(fresh_signups):
+            db.set_allocation_status(self.match_id, "criteria_met")
+            log_ch_id = db.get_config("log_channel_id")
+            manager_role_id = db.get_config("manager_role_id")
+            log_ch = interaction.client.get_channel(int(log_ch_id)) if log_ch_id else None
+            if log_ch:
+                manager_ping = f"<@&{manager_role_id}>" if manager_role_id else "@Managers"
+                msg_link = (
+                    f"https://discord.com/channels/{interaction.guild_id}"
+                    f"/{interaction.channel_id}/{interaction.message.id}"
+                )
+                try:
+                    await log_ch.send(
+                        f"✅ **Minimum crew criteria met** — "
+                        f"[{fresh_match['division']}] {fresh_match['team_home']} vs "
+                        f"{fresh_match['team_away']} <t:{fresh_match['match_time']}:F>\n"
+                        f"{manager_ping} — [View sign-up]({msg_link})\n"
+                        f"Click **Force Schedule** to begin talent allocation."
+                    )
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -149,10 +177,9 @@ class UnavailableButton(discord.ui.Button):
             db.increment_talent_response(user_id, username, display_name)
 
         # Remove all existing signups for this user (roles + unavailable)
-        for s in user_signups:
-            db.remove_signup(self.match_id, s["role"], user_id)
+        db.remove_all_signups_for_user(self.match_id, user_id)
 
-        # Toggle: if not already unavailable, mark unavailable
+        # Toggle: if not already unavailable, mark unavailable and increment count
         if not already_unavailable:
             db.upsert_signup(
                 match_id=self.match_id,
@@ -162,6 +189,7 @@ class UnavailableButton(discord.ui.Button):
                 username=username,
                 display_name=display_name,
             )
+            db.increment_talent_unavailable(user_id, username, display_name)
 
         from scheduler import build_signup_message
         fresh_match = db.get_match(self.match_id) or match

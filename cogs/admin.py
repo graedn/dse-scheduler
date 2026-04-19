@@ -1,9 +1,12 @@
 import discord
+import logging
 from discord import app_commands
 from discord.ext import commands
 from database import Database
 from scheduler import build_matches_announcement, match_end_ts
 from typing import Callable, Optional
+
+log = logging.getLogger(__name__)
 
 
 class AdminCog(commands.Cog):
@@ -163,6 +166,124 @@ class AdminCog(commands.Cog):
             "✅ Log channel unlinked.", ephemeral=True
         )
 
+    @app_commands.command(name="set-proposal-channel",
+                          description="Set the channel where weekly broadcast schedule proposals are posted")
+    async def set_proposal_channel(self, interaction: discord.Interaction,
+                                    channel: discord.TextChannel):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.set_config("proposal_channel_id", str(channel.id))
+        await interaction.response.send_message(
+            f"✅ Proposal channel set to {channel.mention}", ephemeral=True
+        )
+
+    @app_commands.command(name="unset-proposal-channel",
+                          description="Unlink the proposal channel")
+    async def unset_proposal_channel(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.delete_config("proposal_channel_id")
+        await interaction.response.send_message(
+            "✅ Proposal channel unlinked.", ephemeral=True
+        )
+
+    @app_commands.command(name="set-schedule-updates-channel",
+                          description="Set the channel for schedule change notifications (pings affected talent)")
+    async def set_schedule_updates_channel(self, interaction: discord.Interaction,
+                                            channel: discord.TextChannel):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.set_config("schedule_updates_channel_id", str(channel.id))
+        await interaction.response.send_message(
+            f"✅ Schedule updates channel set to {channel.mention}", ephemeral=True
+        )
+
+    @app_commands.command(name="unset-schedule-updates-channel",
+                          description="Unlink the schedule updates channel")
+    async def unset_schedule_updates_channel(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.delete_config("schedule_updates_channel_id")
+        await interaction.response.send_message(
+            "✅ Schedule updates channel unlinked.", ephemeral=True
+        )
+
+    @app_commands.command(name="add-talent-role",
+                          description="Set the Discord role pinged in talent sign-up messages")
+    async def add_talent_role(self, interaction: discord.Interaction,
+                               role: discord.Role):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.set_config("talent_role_id", str(role.id))
+        await interaction.response.send_message(
+            f"✅ Talent role set to **{role.name}**. "
+            f"This role will be @mentioned in new sign-up messages.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="remove-talent-role",
+                          description="Clear the Discord role pinged in talent sign-up messages")
+    async def remove_talent_role(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        if not self.db.get_config("talent_role_id"):
+            await interaction.response.send_message(
+                "No talent role is configured.", ephemeral=True
+            )
+            return
+        self.db.delete_config("talent_role_id")
+        await interaction.response.send_message(
+            "✅ Talent role cleared. Sign-up messages will no longer @mention a role.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="clear-message-history",
+                          description="Delete all messages from a channel (use with caution)")
+    async def clear_message_history(self, interaction: discord.Interaction,
+                                     channel: discord.TextChannel):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        deleted = 0
+        try:
+            # bulk_delete only works on messages <14 days old; purge handles the fallback
+            deleted = await channel.purge(limit=None)
+            deleted = len(deleted)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Missing 'Manage Messages' permission in that channel.", ephemeral=True
+            )
+            return
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Failed to clear channel: {e}", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            f"✅ Deleted {deleted} message(s) from {channel.mention}.", ephemeral=True
+        )
+
     @app_commands.command(name="status",
                           description="Show current bot configuration")
     async def status(self, interaction: discord.Interaction):
@@ -175,11 +296,18 @@ class AdminCog(commands.Cog):
         signup_ch = self.db.get_config("signup_channel_id")
         broadcast_ch = self.db.get_config("broadcast_channel_id")
         log_ch = self.db.get_config("log_channel_id")
+        proposal_ch = self.db.get_config("proposal_channel_id")
+        updates_ch = self.db.get_config("schedule_updates_channel_id")
+        talent_role = self.db.get_config("talent_role_id")
+        manager_role = self.db.get_config("manager_role_id")
         calendar_id = self.db.get_config("teamup_calendar_id")
         api_key = self.db.get_config("teamup_api_key")
 
         def ch_str(ch_id: Optional[str]) -> str:
             return f"<#{ch_id}>" if ch_id else "❌ Not set"
+
+        def role_str(role_id: Optional[str]) -> str:
+            return f"<@&{role_id}>" if role_id else "❌ Not set"
 
         lines = [
             "**Bot Status**",
@@ -187,6 +315,10 @@ class AdminCog(commands.Cog):
             f"Sign-up channel: {ch_str(signup_ch)}",
             f"Broadcast channel: {ch_str(broadcast_ch)}",
             f"Log channel: {ch_str(log_ch)}",
+            f"Proposal channel: {ch_str(proposal_ch)}",
+            f"Schedule updates channel: {ch_str(updates_ch)}",
+            f"Talent role: {role_str(talent_role)}",
+            f"Manager role: {role_str(manager_role)}",
             f"TeamUp calendar: {'✅ Set' if calendar_id else '❌ Not set'}",
             f"TeamUp API key: {'✅ Set' if api_key else '❌ Not set'}",
         ]
@@ -197,7 +329,7 @@ class AdminCog(commands.Cog):
         if not calendar_id: missing.append("`/set-teamup-calendar`")
         if not api_key: missing.append("`/set-teamup-key`")
         if missing:
-            lines.append(f"\n⚠️ Missing config: {', '.join(missing)}")
+            lines.append(f"\n⚠️ Missing required config: {', '.join(missing)}")
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -346,14 +478,93 @@ class AdminCog(commands.Cog):
                 "Manager or Administrator permission required.", ephemeral=True
             )
             return
+        if not self.db.get_config("match_channel_id"):
+            await interaction.response.send_message(
+                "❌ Match channel not configured. Use `/set-match-channel` first.", ephemeral=True
+            )
+            return
         await interaction.response.defer(ephemeral=True)
         events_cog = self.bot.cogs.get("EventsCog")
         if not events_cog:
             await interaction.followup.send("❌ EventsCog not loaded.", ephemeral=True)
             return
-        await events_cog._scan_match_history()
+        try:
+            new_count, date_count = await events_cog._scan_match_history()
+        except Exception as e:
+            log.error("sync-history failed: %s", e)
+            await interaction.followup.send(
+                f"❌ Scan failed: `{e}`", ephemeral=True
+            )
+            return
+        if new_count:
+            await interaction.followup.send(
+                f"✅ Scan complete — **{new_count}** new match(es) logged across "
+                f"**{date_count}** date(s). Proposal messages updated where available.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "✅ Scan complete — no new future matches found (all already logged).",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="post-weekly-proposals",
+                          description="Manually post the weekly proposal messages for the coming week")
+    @app_commands.describe(force="Set to True to update proposals that already exist")
+    async def post_weekly_proposals(self, interaction: discord.Interaction,
+                                    force: bool = False):
+        if not self._manager_check(interaction):
+            await interaction.response.send_message(
+                "Manager or Administrator permission required.", ephemeral=True
+            )
+            return
+
+        if not self.db.get_config("proposal_channel_id"):
+            await interaction.response.send_message(
+                "❌ Proposal channel not configured. Use `/set-proposal-channel` first.",
+                ephemeral=True,
+            )
+            return
+
+        import datetime as _dt
+        from datetime import timedelta
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        today = _dt.datetime.now(tz=ET).date()
+
+        # week_start = this Monday (so the safeguard checks the current week)
+        this_monday = today - timedelta(days=today.weekday())
+        week_start = this_monday.isoformat()
+
+        existing = self.db.get_proposal_messages_for_week(week_start)
+        already_posted = [p for p in existing if p.get("discord_message_id")]
+
+        if already_posted and not force:
+            await interaction.response.send_message(
+                f"⚠️ Proposal messages for this week (starting **{week_start}**) are already "
+                f"posted ({len(already_posted)} message(s)). Run with `force: True` to "
+                f"update them (e.g. after a bot restart).",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        from cogs.weekly_proposals import create_weekly_proposals
+        try:
+            await create_weekly_proposals(self.bot, self.db, start_date=today)
+        except Exception as e:
+            log.error("post-weekly-proposals failed: %s", e)
+            await interaction.followup.send(f"❌ Failed: `{e}`", ephemeral=True)
+            return
+
+        days_until_sunday = 6 - today.weekday()
+        day_count = days_until_sunday + 1
+        action = "updated" if already_posted else "created"
         await interaction.followup.send(
-            "✅ History scan complete. Check the log channel for results.", ephemeral=True
+            f"✅ Weekly proposal messages {action} — **{day_count}** day(s) "
+            f"from today through Sunday.",
+            ephemeral=True,
         )
 
     @app_commands.command(name="set-timezone",
@@ -626,14 +837,14 @@ class AdminCog(commands.Cog):
                 "No talent records yet.", ephemeral=True
             )
             return
-        lines = ["**Talent Broadcast Counts:**"]
+        lines = ["**Talent (Broadcasts - Responses - Unavailable):**"]
         for i, t in enumerate(talent, 1):
-            bc = t['broadcast_count']
-            rc = t.get('response_count', 0)
+            bc = t["broadcast_count"]
+            rc = t.get("response_count", 0)
+            uc = t.get("unavailable_count", 0)
             lines.append(
                 f"  {i}. {t['display_name']} ({t['username']}) "
-                f"— **{bc}** broadcast{'s' if bc != 1 else ''}"
-                f" - **{rc}** Response{'s' if rc != 1 else ''}"
+                f"— {bc} - {rc} - {uc}"
             )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 

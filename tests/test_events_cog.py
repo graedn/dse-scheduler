@@ -1,18 +1,18 @@
-"""Tests for EventsCog._scan_match_history() (M7).
+"""Tests for EventsCog._scan_match_history() and on_message().
 
-Mocks channel.history (async generator) and schedule_for_date so no
-real Discord or TeamUp calls are made.  Uses a real in-memory Database.
+Uses a real in-memory Database. The new flow does NOT auto-schedule;
+it just logs matches and dispatches 'match_logged' events.
 """
 import pytest
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from database import Database
 from cogs.events import EventsCog
 
 # A future timestamp (2099-01-01 20:00 UTC — well past 'now' in any test run)
-FUTURE_TS  = int(datetime(2099, 1, 1, 20, 0, tzinfo=timezone.utc).timestamp())
+FUTURE_TS   = int(datetime(2099, 1, 1, 20, 0, tzinfo=timezone.utc).timestamp())
 FUTURE_DATE = "2099-01-01"
-PAST_TS    = int(datetime(2000, 1, 1, 20, 0, tzinfo=timezone.utc).timestamp())
+PAST_TS     = int(datetime(2000, 1, 1, 20, 0, tzinfo=timezone.utc).timestamp())
 
 
 def _make_message(content: str, is_bot=False):
@@ -39,14 +39,12 @@ async def _async_gen(*messages):
 
 
 def _make_match_channel(*messages):
-    """A channel mock whose .history() yields the given messages."""
     ch = MagicMock()
     ch.history.return_value = _async_gen(*messages)
     return ch
 
 
 def _make_log_channel():
-    """A channel mock that supports await send()."""
     return AsyncMock()
 
 
@@ -60,6 +58,7 @@ def db():
 def _make_cog(db, match_channel, log_channel=None):
     """Build an EventsCog with mocked bot channels."""
     bot = MagicMock()
+    bot.dispatch = MagicMock()  # track dispatch calls
 
     def _get_channel(ch_id):
         if str(ch_id) == "123":
@@ -84,11 +83,10 @@ async def test_scan_skips_bot_messages(db):
     match_ch = _make_match_channel(_make_message(_valid_post(), is_bot=True))
     cog = _make_cog(db, match_ch, log_ch)
 
-    with patch("cogs.events.schedule_for_date", new_callable=AsyncMock) as mock_sched:
-        await cog._scan_match_history()
+    await cog._scan_match_history()
 
     assert db.get_matches_for_date(FUTURE_DATE) == []
-    mock_sched.assert_not_called()
+    cog.bot.dispatch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -100,30 +98,32 @@ async def test_scan_skips_past_matches(db):
     match_ch = _make_match_channel(_make_message(_valid_post(ts=PAST_TS)))
     cog = _make_cog(db, match_ch, log_ch)
 
-    with patch("cogs.events.schedule_for_date", new_callable=AsyncMock) as mock_sched:
-        await cog._scan_match_history()
+    await cog._scan_match_history()
 
     assert db.get_matches_for_date(FUTURE_DATE) == []
-    mock_sched.assert_not_called()
+    cog.bot.dispatch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# New future match is inserted and scheduled
+# New future match is inserted and dispatched
 # ---------------------------------------------------------------------------
 
-async def test_scan_inserts_new_match_and_schedules(db):
+async def test_scan_inserts_new_match_and_dispatches(db):
     log_ch = _make_log_channel()
     match_ch = _make_match_channel(_make_message(_valid_post(ts=FUTURE_TS)))
     cog = _make_cog(db, match_ch, log_ch)
 
-    with patch("cogs.events.schedule_for_date", new_callable=AsyncMock) as mock_sched:
-        await cog._scan_match_history()
+    await cog._scan_match_history()
 
     matches = db.get_matches_for_date(FUTURE_DATE)
     assert len(matches) == 1
     assert matches[0]["team_home"] == "Alpha"
     assert matches[0]["team_away"] == "Beta"
-    mock_sched.assert_called_once()
+
+    # Dispatches match_logged for the date
+    cog.bot.dispatch.assert_called_once_with("match_logged", FUTURE_DATE)
+
+    # Log channel notified with count
     log_ch.send.assert_called_once()
     assert "1" in log_ch.send.call_args[0][0]
 
@@ -139,11 +139,10 @@ async def test_scan_skips_already_known_match(db):
     match_ch = _make_match_channel(_make_message(_valid_post(ts=FUTURE_TS)))
     cog = _make_cog(db, match_ch, log_ch)
 
-    with patch("cogs.events.schedule_for_date", new_callable=AsyncMock) as mock_sched:
-        await cog._scan_match_history()
+    await cog._scan_match_history()
 
     assert len(db.get_matches_for_date(FUTURE_DATE)) == 1   # no duplicate
-    mock_sched.assert_not_called()
+    cog.bot.dispatch.assert_not_called()
     assert "no new" in log_ch.send.call_args[0][0].lower()
 
 
@@ -159,18 +158,17 @@ async def test_scan_ignores_non_match_messages(db):
     )
     cog = _make_cog(db, match_ch, log_ch)
 
-    with patch("cogs.events.schedule_for_date", new_callable=AsyncMock) as mock_sched:
-        await cog._scan_match_history()
+    await cog._scan_match_history()
 
     assert db.get_matches_for_date(FUTURE_DATE) == []
-    mock_sched.assert_not_called()
+    cog.bot.dispatch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# schedule_for_date called once per unique date
+# dispatch called once per unique date (not once per match)
 # ---------------------------------------------------------------------------
 
-async def test_scan_schedules_per_date_not_per_match(db):
+async def test_scan_dispatches_per_date_not_per_match(db):
     ts1 = FUTURE_TS
     ts2 = FUTURE_TS + 7200  # 2h later on the same calendar day
     post1 = f"Division: Premier\nWeek: 1\nAlpha vs Beta\nTime: <t:{ts1}:F>"
@@ -183,12 +181,12 @@ async def test_scan_schedules_per_date_not_per_match(db):
     )
     cog = _make_cog(db, match_ch, log_ch)
 
-    with patch("cogs.events.schedule_for_date", new_callable=AsyncMock) as mock_sched:
-        await cog._scan_match_history()
+    await cog._scan_match_history()
 
     assert len(db.get_matches_for_date(FUTURE_DATE)) == 2
-    # Two matches, same date — schedule_for_date called only once
-    assert mock_sched.call_count == 1
+    # Two matches, same date — dispatch called only once for the date
+    assert cog.bot.dispatch.call_count == 1
+    cog.bot.dispatch.assert_called_once_with("match_logged", FUTURE_DATE)
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +195,61 @@ async def test_scan_schedules_per_date_not_per_match(db):
 
 async def test_scan_works_without_log_channel(db):
     match_ch = _make_match_channel(_make_message(_valid_post(ts=FUTURE_TS)))
-    cog = _make_cog(db, match_ch, log_channel=None)  # no log channel
+    cog = _make_cog(db, match_ch, log_channel=None)
 
-    with patch("cogs.events.schedule_for_date", new_callable=AsyncMock):
-        await cog._scan_match_history()  # must not raise
+    await cog._scan_match_history()  # must not raise
 
     assert len(db.get_matches_for_date(FUTURE_DATE)) == 1
+
+
+# ---------------------------------------------------------------------------
+# on_message: new match is inserted and dispatched
+# ---------------------------------------------------------------------------
+
+async def test_on_message_inserts_new_match(db):
+    log_ch = _make_log_channel()
+    match_ch = MagicMock()
+    cog = _make_cog(db, match_ch, log_ch)
+
+    msg = _make_message(_valid_post(ts=FUTURE_TS))
+    msg.author.bot = False
+    msg.channel.id = 123  # matches match_channel_id
+
+    await cog.on_message(msg)
+
+    matches = db.get_matches_for_date(FUTURE_DATE)
+    assert len(matches) == 1
+    cog.bot.dispatch.assert_called_once_with("match_logged", FUTURE_DATE)
+
+
+async def test_on_message_skips_duplicate(db):
+    db.insert_match("Premier", "1", "Alpha", "Beta", FUTURE_TS, FUTURE_TS - 3600)
+
+    log_ch = _make_log_channel()
+    match_ch = MagicMock()
+    cog = _make_cog(db, match_ch, log_ch)
+
+    msg = _make_message(_valid_post(ts=FUTURE_TS))
+    msg.author.bot = False
+    msg.channel.id = 123
+
+    await cog.on_message(msg)
+
+    # No new match inserted, no dispatch
+    assert len(db.get_matches_for_date(FUTURE_DATE)) == 1
+    cog.bot.dispatch.assert_not_called()
+
+
+async def test_on_message_ignores_wrong_channel(db):
+    log_ch = _make_log_channel()
+    match_ch = MagicMock()
+    cog = _make_cog(db, match_ch, log_ch)
+
+    msg = _make_message(_valid_post(ts=FUTURE_TS))
+    msg.author.bot = False
+    msg.channel.id = 999  # wrong channel
+
+    await cog.on_message(msg)
+
+    assert db.get_matches_for_date(FUTURE_DATE) == []
+    cog.bot.dispatch.assert_not_called()

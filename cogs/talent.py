@@ -1,5 +1,4 @@
 import discord
-import json
 import logging
 
 from database import Database
@@ -8,9 +7,6 @@ from scheduler import (
 )
 
 log = logging.getLogger(__name__)
-
-# Required roles in selection order
-ROLE_ORDER = ["producer", "observer", "pbp", "colour"]
 
 
 # ---------------------------------------------------------------------------
@@ -22,11 +18,10 @@ def build_talent_description_from_assignments(role_assignments: dict) -> str:
     display_order = [
         ("producer",  "Producer"),
         ("observer",  "Observer"),
-        ("pbp",       "Play-by-Play"),
-        ("colour",    "Colour Caster"),
+        ("pbp_1",     "Play-by-Play"),
+        ("colour_1",  "Colour Caster"),
         ("host",      "Host"),
         ("analyst_1", "Analyst"),
-        ("analyst_2", "Analyst"),
     ]
     parts = []
     for key, label in display_order:
@@ -40,7 +35,7 @@ def build_talent_description_from_assignments(role_assignments: dict) -> str:
 def _get_required_user_ids(role_assignments: dict) -> set[str]:
     """User IDs from required roles only (the ones who must confirm)."""
     ids: set[str] = set()
-    for role_key in ROLE_ORDER:
+    for role_key in ("producer", "observer", "pbp_1", "colour_1"):
         assignment = role_assignments.get(role_key)
         if assignment:
             ids.add(assignment["user_id"])
@@ -48,23 +43,41 @@ def _get_required_user_ids(role_assignments: dict) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Single-step allocation UI
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_all_signup_options(signups: list[dict], db: Database,
+                               include_none: bool = False) -> list[discord.SelectOption]:
+    """Build select options from all signups, sorted by sign-up time."""
+    options = []
+    if include_none:
+        options.append(discord.SelectOption(label="None", value="__none__", default=True))
+    seen = set()
+    for s in sorted(signups, key=lambda x: x["signed_up_at"]):
+        if s["user_id"] in seen:
+            continue
+        seen.add(s["user_id"])
+        count = db.get_talent_count(s["user_id"])
+        role_label = ROLE_LABELS.get(s["role"], s["role"])
+        label = f"{s['display_name']} [{count} bcast{'s' if count != 1 else ''}] ({role_label})"
+        options.append(discord.SelectOption(
+            label=label[:100],
+            value=s["user_id"],
+            description=s["username"][:100],
+        ))
+    return options
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 components — required roles
 # ---------------------------------------------------------------------------
 
 class _RoleSelect(discord.ui.Select):
-    """A select for a single required role (Producer or Observer)."""
+    """Single-select for a required role, showing ALL sign-ups."""
     def __init__(self, role_key: str, role_label: str, match_id: int,
-                 signups: list[dict], db: Database, row: int):
+                 all_signups: list[dict], db: Database, row: int):
         self._role_key = role_key
-        options: list[discord.SelectOption] = []
-        for s in signups:
-            count = db.get_talent_count(s["user_id"])
-            label = f"{s['display_name']} [{count} bcast{'s' if count != 1 else ''}]"
-            options.append(discord.SelectOption(
-                label=label[:100],
-                value=s["user_id"],
-                description=s["username"][:100],
-            ))
+        options = _build_all_signup_options(all_signups, db)
         if not options:
             options = [discord.SelectOption(label="No sign-ups", value="__none__")]
 
@@ -85,75 +98,95 @@ class _RoleSelect(discord.ui.Select):
         await interaction.response.defer()
 
 
-class _CasterSelect(discord.ui.Select):
-    """Combined Play-by-Play + Colour Caster select (encoded values 'pbp:uid', 'colour:uid')."""
-    def __init__(self, match_id: int, pbp_signups: list[dict],
-                 colour_signups: list[dict], db: Database):
-        options: list[discord.SelectOption] = []
-        for s in pbp_signups:
-            count = db.get_talent_count(s["user_id"])
-            options.append(discord.SelectOption(
-                label=f"PBP: {s['display_name']} [{count}]"[:100],
-                value=f"pbp:{s['user_id']}",
-                description=s["username"][:100],
-            ))
-        for s in colour_signups:
-            count = db.get_talent_count(s["user_id"])
-            options.append(discord.SelectOption(
-                label=f"Colour: {s['display_name']} [{count}]"[:100],
-                value=f"colour:{s['user_id']}",
-                description=s["username"][:100],
-            ))
-        if not options:
-            options = [discord.SelectOption(label="No sign-ups", value="__none__")]
-
+class _ContinueButton(discord.ui.Button):
+    """Validates required role selections and advances to Phase 2."""
+    def __init__(self, match_id: int):
         super().__init__(
-            custom_id=f"alloc_caster_{match_id}",
-            placeholder="Select Play-by-Play and Colour Caster...",
-            options=options,
-            min_values=0,
-            max_values=min(2, len(options)),
-            row=2,
+            label="Continue →",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"alloc_continue_{match_id}",
+            row=4,
         )
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.caster_selections = [v for v in self.values if v != "__none__"]
-        await interaction.response.defer()
+        if not interaction.guild:
+            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
+            return
+        is_admin = interaction.user.guild_permissions.administrator
+        is_mgr = self.view.db.is_manager(str(interaction.user.id))
+        if not is_admin and not is_mgr:
+            await interaction.response.send_message(
+                "Only managers and administrators can confirm allocations.", ephemeral=True
+            )
+            return
+
+        sel = self.view.selections
+        missing = [label for key, label in [
+            ("producer", "Producer"), ("observer", "Observer"),
+            ("pbp", "Play-by-Play"), ("colour", "Colour Caster"),
+        ] if key not in sel]
+        if missing:
+            await interaction.response.send_message(
+                f"❌ Please select: {', '.join(missing)}", ephemeral=True
+            )
+            return
+
+        if sel["pbp"] == sel["colour"]:
+            await interaction.response.send_message(
+                "❌ The same person cannot be both Play-by-Play and Colour Caster.",
+                ephemeral=True,
+            )
+            return
+
+        casters = {sel["pbp"], sel["colour"]}
+        if sel.get("producer") in casters:
+            await interaction.response.send_message(
+                "❌ The Producer cannot also be a Play-by-Play or Colour Caster.",
+                ephemeral=True,
+            )
+            return
+        if sel.get("observer") in casters:
+            await interaction.response.send_message(
+                "❌ The Observer cannot also be a Play-by-Play or Colour Caster.",
+                ephemeral=True,
+            )
+            return
+
+        phase2 = AllocationConfirmView(
+            self.view.match, self.view.signups, self.view.db,
+            self.view.broadcast_channel, self.view.log_channel, self.view.get_teamup,
+            required_selections=dict(sel),
+        )
+        await interaction.response.edit_message(view=phase2)
 
 
-class _OptionalSelect(discord.ui.Select):
-    """Combined Host + Analyst select (encoded values 'host:uid', 'analyst:uid')."""
-    def __init__(self, match_id: int, host_signups: list[dict],
-                 analyst_signups: list[dict], db: Database):
-        options: list[discord.SelectOption] = []
-        for s in host_signups:
-            count = db.get_talent_count(s["user_id"])
-            options.append(discord.SelectOption(
-                label=f"Host: {s['display_name']} [{count}]"[:100],
-                value=f"host:{s['user_id']}",
-                description=s["username"][:100],
-            ))
-        for s in analyst_signups:
-            count = db.get_talent_count(s["user_id"])
-            options.append(discord.SelectOption(
-                label=f"Analyst: {s['display_name']} [{count}]"[:100],
-                value=f"analyst:{s['user_id']}",
-                description=s["username"][:100],
-            ))
-        if not options:
-            options = [discord.SelectOption(label="None (no optional roles)", value="__none__")]
+# ---------------------------------------------------------------------------
+# Phase 2 components — optional roles + confirm
+# ---------------------------------------------------------------------------
+
+class _OptionalRoleSelect(discord.ui.Select):
+    """Single-select for an optional role (Host/Analyst), with None as default."""
+    def __init__(self, role_key: str, role_label: str, match_id: int,
+                 all_signups: list[dict], db: Database, row: int):
+        self._role_key = role_key
+        options = _build_all_signup_options(all_signups, db, include_none=True)
+        if len(options) == 1:  # only None option
+            options.append(discord.SelectOption(label="No sign-ups", value="__none__"))
 
         super().__init__(
-            custom_id=f"alloc_optional_{match_id}",
-            placeholder="Host / Analyst (optional)...",
+            custom_id=f"alloc_{role_key}_{match_id}",
+            placeholder=f"Select {role_label} (optional)...",
             options=options,
             min_values=0,
-            max_values=min(3, len(options)),
-            row=3,
+            max_values=1,
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.optional_selections = [v for v in self.values if v != "__none__"]
+        if self.values and self.values[0] != "__none__":
+            self.view.optional_selections[self._role_key] = self.values[0]
+        elif self._role_key in self.view.optional_selections:
+            del self.view.optional_selections[self._role_key]
         await interaction.response.defer()
 
 
@@ -164,7 +197,7 @@ class _ConfirmButton(discord.ui.Button):
             emoji="✅",
             style=discord.ButtonStyle.success,
             custom_id=f"alloc_confirm_{match_id}",
-            row=4,
+            row=2,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -181,8 +214,6 @@ class _ConfirmButton(discord.ui.Button):
 
         view = self.view
 
-        # Guard: if the match was removed from the calendar by a schedule change,
-        # the allocation is no longer valid — reject before doing anything.
         fresh_match = view.db.get_match(view.match["id"])
         if not fresh_match or not fresh_match.get("teamup_event_id"):
             await interaction.response.send_message(
@@ -192,78 +223,32 @@ class _ConfirmButton(discord.ui.Button):
             )
             return
 
-        # Validate required roles
-        missing = [r for r in ROLE_ORDER if r not in view.selections
-                   and r not in ("pbp", "colour")]  # casters validated separately
+        all_sigs = view.db.get_signups_for_match(view.match["id"])
+        signups_by_id = {s["user_id"]: s for s in all_sigs}
+        for uid, s in view.signups_by_id.items():
+            if uid not in signups_by_id:
+                signups_by_id[uid] = s
 
-        # Validate caster selections (need exactly 1 PBP and 1 Colour)
-        caster_roles = {}
-        for val in view.caster_selections:
-            role, uid = val.split(":", 1)
-            if role in caster_roles:
-                await interaction.response.send_message(
-                    f"❌ You selected two **{ROLE_LABELS[role]}** — pick one each for PBP and Colour.",
-                    ephemeral=True,
-                )
-                return
-            caster_roles[role] = uid
-
-        for req_caster in ("pbp", "colour"):
-            if req_caster not in caster_roles:
-                missing.append(req_caster)
-
-        if missing:
-            labels = [ROLE_LABELS[r] for r in missing]
-            await interaction.response.send_message(
-                f"❌ Please select: {', '.join(labels)}", ephemeral=True
-            )
-            return
-
-        # Build role_assignments
         role_assignments: dict = {}
-        for role_key in ("producer", "observer"):
-            uid = view.selections[role_key]
-            s = view.signups_by_id.get(uid)
-            if not s:
-                all_sigs = view.db.get_signups_for_match(view.match["id"])
-                s = next((x for x in all_sigs if x["user_id"] == uid), None)
+
+        key_map = {"producer": "producer", "observer": "observer",
+                   "pbp": "pbp_1", "colour": "colour_1"}
+        for sel_key, db_key in key_map.items():
+            uid = view.required_selections[sel_key]
+            s = signups_by_id.get(uid)
             if s:
-                role_assignments[role_key] = {
+                role_assignments[db_key] = {
                     "user_id":      s["user_id"],
                     "username":     s["username"],
                     "display_name": s["display_name"],
                 }
 
-        for role_key, uid in caster_roles.items():
-            s = view.signups_by_id.get(uid)
-            if not s:
-                all_sigs = view.db.get_signups_for_match(view.match["id"])
-                s = next((x for x in all_sigs if x["user_id"] == uid), None)
-            if s:
-                role_assignments[role_key] = {
-                    "user_id":      s["user_id"],
-                    "username":     s["username"],
-                    "display_name": s["display_name"],
-                }
-
-        # Optional roles (host + analysts)
-        analyst_count = 0
-        for val in view.optional_selections:
-            role_type, uid = val.split(":", 1)
-            s = view.signups_by_id.get(uid)
-            if not s:
-                all_sigs = view.db.get_signups_for_match(view.match["id"])
-                s = next((x for x in all_sigs if x["user_id"] == uid), None)
-            if s:
-                if role_type == "host":
-                    role_assignments["host"] = {
-                        "user_id":      s["user_id"],
-                        "username":     s["username"],
-                        "display_name": s["display_name"],
-                    }
-                elif role_type == "analyst" and analyst_count < 2:
-                    analyst_count += 1
-                    role_assignments[f"analyst_{analyst_count}"] = {
+        for role_key, db_key in [("host", "host"), ("analyst", "analyst_1")]:
+            uid = view.optional_selections.get(role_key)
+            if uid:
+                s = signups_by_id.get(uid)
+                if s:
+                    role_assignments[db_key] = {
                         "user_id":      s["user_id"],
                         "username":     s["username"],
                         "display_name": s["display_name"],
@@ -299,10 +284,8 @@ class _ConfirmButton(discord.ui.Button):
         optional_parts = []
         if "host" in role_assignments:
             optional_parts.append(f"Host: {role_assignments['host']['display_name']}")
-        for i in range(1, 3):
-            a = role_assignments.get(f"analyst_{i}")
-            if a:
-                optional_parts.append(f"Analyst: {a['display_name']}")
+        if "analyst_1" in role_assignments:
+            optional_parts.append(f"Analyst: {role_assignments['analyst_1']['display_name']}")
         summary = (" " + ", ".join(optional_parts) + ".") if optional_parts else " No optional roles."
 
         await interaction.response.edit_message(
@@ -314,14 +297,88 @@ class _ConfirmButton(discord.ui.Button):
         )
 
 
+# ---------------------------------------------------------------------------
+# Shared cancel logic
+# ---------------------------------------------------------------------------
+
+async def _cancel_broadcast(interaction: discord.Interaction, view) -> None:
+    """Shared cancel logic callable from any allocation view phase."""
+    match = view.match
+    teamup = view.get_teamup()
+
+    event_id = match.get("teamup_event_id")
+    if teamup and event_id:
+        try:
+            teamup.delete_event(event_id)
+        except Exception as e:
+            log.warning("Failed to delete TeamUp event %s during cancel: %s", event_id, e)
+        view.db.update_match_teamup_id(match["id"], None)
+        view.db.decrement_scheduled_count(match["team_home"])
+        view.db.decrement_scheduled_count(match["team_away"])
+
+    view.db.reset_allocation(match["id"])
+
+    signups = view.db.get_signups_for_match(match["id"])
+    all_user_ids = list({s["user_id"] for s in signups})
+    mentions = " ".join(f"<@{uid}>" for uid in all_user_ids)
+    ts = match["match_time"]
+    cancel_text = (
+        f"{_SEPARATOR}\n"
+        f"🚫 **Broadcast Cancelled**\n"
+        f"**[{match['division']}] {match['team_home']} vs {match['team_away']}** | <t:{ts}:F>\n\n"
+        f"This broadcast has been cancelled by management.\n"
+    )
+    if mentions:
+        cancel_text += f"\n{mentions}"
+
+    updates_ch_id = view.db.get_config("schedule_updates_channel_id")
+    updates_ch = (interaction.client.get_channel(int(updates_ch_id))
+                  if updates_ch_id else None)
+    notify_ch = updates_ch or view.broadcast_channel
+    if notify_ch:
+        try:
+            await notify_ch.send(cancel_text)
+        except Exception as e:
+            log.error("Failed to send cancellation for match %s: %s", match["id"], e)
+
+    signup_ch_id = (view.db.get_config("signup_channel_id")
+                    or view.db.get_config("broadcast_channel_id"))
+    signup_ch = interaction.client.get_channel(int(signup_ch_id)) if signup_ch_id else None
+    bcast = view.db.get_broadcast_message(match["id"])
+    if bcast and signup_ch:
+        try:
+            signup_msg = await signup_ch.fetch_message(int(bcast["discord_message_id"]))
+            await signup_msg.edit(
+                content=(
+                    f"{_SEPARATOR}\n"
+                    f"❌ **BROADCAST CANCELLED**\n"
+                    f"📋 [{match['division']}] {match['team_home']} vs {match['team_away']}\n"
+                    f"<t:{ts}:F>\n\n"
+                    f"This broadcast has been cancelled by management."
+                ),
+                view=discord.ui.View(),
+            )
+        except Exception as e:
+            log.error("Failed to edit sign-up message for cancelled match %s: %s",
+                      match["id"], e)
+
+    view.stop()
+    for child in view.children:
+        child.disabled = True
+    await interaction.response.edit_message(
+        content=interaction.message.content + "\n\n❌ **Broadcast cancelled.**",
+        view=view,
+    )
+
+
 class _CancelButton(discord.ui.Button):
-    def __init__(self, match_id: int):
+    def __init__(self, match_id: int, row: int = 4):
         super().__init__(
             label="Cancel Broadcast",
             emoji="❌",
             style=discord.ButtonStyle.danger,
             custom_id=f"alloc_cancel_{match_id}",
-            row=4,
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -338,102 +395,60 @@ class _CancelButton(discord.ui.Button):
         await self.view.cancel_broadcast(interaction)
 
 
+# ---------------------------------------------------------------------------
+# View classes
+# ---------------------------------------------------------------------------
+
 class AllocationView(discord.ui.View):
+    """Phase 1 — select the four required roles, then click Continue."""
+
     def __init__(self, match: dict, signups: list[dict], db: Database,
                  broadcast_channel, log_channel, get_teamup):
         super().__init__(timeout=86400)
         self.match = match
+        self.signups = signups
         self.db = db
         self.broadcast_channel = broadcast_channel
         self.log_channel = log_channel
         self.get_teamup = get_teamup
-        self.selections: dict[str, str] = {}      # role_key -> user_id
-        self.caster_selections: list[str] = []    # encoded "pbp:uid" / "colour:uid"
-        self.optional_selections: list[str] = []  # encoded "host:uid" / "analyst:uid"
+        self.selections: dict[str, str] = {}
         self.signups_by_id = {s["user_id"]: s for s in signups}
 
-        by_role: dict[str, list] = {r: [] for r in ROLE_EMOJIS}
-        for s in sorted(signups, key=lambda x: x["signed_up_at"]):
-            if s["role"] in by_role:
-                by_role[s["role"]].append(s)
-
-        # Row 0: Producer, Row 1: Observer
-        self.add_item(_RoleSelect("producer", "Producer", match["id"],
-                                  by_role["producer"], db, row=0))
-        self.add_item(_RoleSelect("observer", "Observer", match["id"],
-                                  by_role["observer"], db, row=1))
-        # Row 2: PBP + Colour combined
-        self.add_item(_CasterSelect(match["id"], by_role["pbp"], by_role["colour"], db))
-        # Row 3: Host + Analyst combined (optional)
-        self.add_item(_OptionalSelect(match["id"], by_role["host"], by_role["analyst"], db))
-        # Row 4: Confirm + Cancel
-        self.add_item(_ConfirmButton(match["id"]))
-        self.add_item(_CancelButton(match["id"]))
+        self.add_item(_RoleSelect("producer",  "Producer",      match["id"], signups, db, row=0))
+        self.add_item(_RoleSelect("observer",  "Observer",      match["id"], signups, db, row=1))
+        self.add_item(_RoleSelect("pbp",       "Play-by-Play",  match["id"], signups, db, row=2))
+        self.add_item(_RoleSelect("colour",    "Colour Caster", match["id"], signups, db, row=3))
+        self.add_item(_ContinueButton(match["id"]))
+        self.add_item(_CancelButton(match["id"], row=4))
 
     async def cancel_broadcast(self, interaction: discord.Interaction):
-        match = self.match
-        teamup = self.get_teamup()
+        await _cancel_broadcast(interaction, self)
 
-        event_id = match.get("teamup_event_id")
-        if teamup and event_id:
-            try:
-                teamup.delete_event(event_id)
-            except Exception as e:
-                log.warning("Failed to delete TeamUp event %s during cancel: %s", event_id, e)
-            self.db.update_match_teamup_id(match["id"], None)
-            self.db.decrement_scheduled_count(match["team_home"])
-            self.db.decrement_scheduled_count(match["team_away"])
 
-        self.db.reset_allocation(match["id"])
+class AllocationConfirmView(discord.ui.View):
+    """Phase 2 — select optional roles, then confirm or cancel."""
 
-        signups = self.db.get_signups_for_match(match["id"])
-        all_user_ids = list({s["user_id"] for s in signups})
-        mentions = " ".join(f"<@{uid}>" for uid in all_user_ids)
-        ts = match["match_time"]
-        cancel_text = (
-            f"{_SEPARATOR}\n"
-            f"🚫 **Broadcast Cancelled**\n"
-            f"**[{match['division']}] {match['team_home']} vs {match['team_away']}** | <t:{ts}:F>\n\n"
-            f"This broadcast has been cancelled by management.\n"
-        )
-        if mentions:
-            cancel_text += f"\n{mentions}"
+    def __init__(self, match: dict, signups: list[dict], db: Database,
+                 broadcast_channel, log_channel, get_teamup,
+                 required_selections: dict):
+        super().__init__(timeout=86400)
+        self.match = match
+        self.signups = signups
+        self.db = db
+        self.broadcast_channel = broadcast_channel
+        self.log_channel = log_channel
+        self.get_teamup = get_teamup
+        self.required_selections = required_selections
+        self.optional_selections: dict[str, str] = {}
+        self.signups_by_id = {s["user_id"]: s for s in signups}
 
-        if self.broadcast_channel:
-            try:
-                await self.broadcast_channel.send(cancel_text)
-            except Exception as e:
-                log.error("Failed to send cancellation for match %s: %s", match["id"], e)
+        self.add_item(_OptionalRoleSelect("host",    "Host",    match["id"], signups, db, row=0))
+        self.add_item(_OptionalRoleSelect("analyst", "Analyst", match["id"], signups, db, row=1))
+        self.add_item(_ConfirmButton(match["id"]))
+        self.add_item(_CancelButton(match["id"], row=2))
 
-        # Edit the sign-up message to show cancelled
-        signup_ch_id = (self.db.get_config("signup_channel_id")
-                        or self.db.get_config("broadcast_channel_id"))
-        signup_ch = interaction.client.get_channel(int(signup_ch_id)) if signup_ch_id else None
-        bcast = self.db.get_broadcast_message(match["id"])
-        if bcast and signup_ch:
-            try:
-                signup_msg = await signup_ch.fetch_message(int(bcast["discord_message_id"]))
-                await signup_msg.edit(
-                    content=(
-                        f"{_SEPARATOR}\n"
-                        f"❌ **BROADCAST CANCELLED**\n"
-                        f"📋 [{match['division']}] {match['team_home']} vs {match['team_away']}\n"
-                        f"<t:{ts}:F>\n\n"
-                        f"This broadcast has been cancelled by management."
-                    ),
-                    view=discord.ui.View(),
-                )
-            except Exception as e:
-                log.error("Failed to edit sign-up message for cancelled match %s: %s",
-                          match["id"], e)
-
-        self.stop()
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(
-            content=interaction.message.content + "\n\n❌ **Broadcast cancelled.**",
-            view=self,
-        )
+    async def cancel_broadcast(self, interaction: discord.Interaction):
+        await _cancel_broadcast(interaction, self)
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +458,7 @@ class AllocationView(discord.ui.View):
 async def send_allocation_request(db: Database, match: dict,
                                    log_channel, broadcast_channel,
                                    get_teamup=None) -> None:
-    """Send the single-step talent allocation UI to the log channel."""
+    """Send the two-phase talent allocation UI to the log channel."""
     if not log_channel:
         return
 
@@ -480,7 +495,11 @@ async def send_allocation_request(db: Database, match: dict,
             names = "—"
         lines.append(f"**{label}**{opt}: {names}")
 
-    lines += ["", "Select talent for each role below, then confirm. Use **Force Schedule** on the sign-up post to re-trigger this if needed:"]
+    lines += [
+        "",
+        "Select required roles below, then click **Continue** to assign optional roles.",
+        "Use **Force Schedule** on the sign-up post to re-trigger this if needed.",
+    ]
     text = "\n".join(lines)
 
     view = AllocationView(match, signups, db, broadcast_channel, log_channel, get_teamup)

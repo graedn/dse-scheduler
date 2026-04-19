@@ -6,17 +6,18 @@ from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
+from datetime import datetime
 
 from database import Database
 from teamup import TeamUpClient
 from scheduler import (
-    run_daily_sweep, run_morning_check, build_matches_announcement,
     build_signup_message, is_fully_staffed, _SEPARATOR,
 )
 from cogs.admin import AdminCog
 from cogs.blocks import BlocksCog
 from cogs.events import EventsCog
 from cogs.talent import send_allocation_request
+from cogs.weekly_proposals import WeeklyProposalsCog, create_weekly_proposals, mark_passed_proposals
 
 load_dotenv()
 ET = ZoneInfo("America/New_York")
@@ -45,30 +46,36 @@ def get_teamup() -> "TeamUpClient | None":
 bot.get_teamup = get_teamup
 
 
-async def announce_job():
-    log_ch_id = db.get_config("log_channel_id")
-    log_ch = bot.get_channel(int(log_ch_id)) if log_ch_id else None
-    if not log_ch:
-        print("[announce] Skipped — log channel not configured.")
+async def scan_job():
+    """Match channel scan — runs at 9am, 6pm, and 11:59pm ET (skipped on Sundays)."""
+    if datetime.now(tz=ET).weekday() == 6:  # Sunday = 6
+        print("[scan] Skipped — Sunday is reserved for weekly proposals.")
         return
+
+    events_cog = bot.cogs.get("EventsCog")
+    if not events_cog:
+        print("[scan] Skipped — EventsCog not loaded.")
+        return
+
     try:
-        msg = build_matches_announcement(db)
-        if msg:
-            await log_ch.send(msg)
+        await events_cog._scan_match_history(limit=500)
     except Exception as e:
-        log.error("[announce] Failed to post matches announcement: %s", e)
+        log.error("[scan] Match history scan failed: %s", e)
+
+    # Mark any open proposals whose dates have now passed
+    try:
+        await mark_passed_proposals(db, bot)
+    except Exception as e:
+        log.error("[scan] mark_passed_proposals failed: %s", e)
 
 
-async def morning_job():
-    teamup = get_teamup()
-    broadcast_ch_id = db.get_config("broadcast_channel_id")
-    signup_ch_id = db.get_config("signup_channel_id")
-    broadcast_ch = bot.get_channel(int(broadcast_ch_id)) if broadcast_ch_id else None
-    signup_ch = bot.get_channel(int(signup_ch_id)) if signup_ch_id else None
-    if teamup and broadcast_ch:
-        await run_morning_check(db, teamup, broadcast_ch, signup_channel=signup_ch)
-    else:
-        print("[morning] Skipped — missing TeamUp credentials or broadcast channel.")
+async def weekly_proposals_job():
+    """Sunday 11pm ET: create or update the upcoming week's 7 proposal messages."""
+    try:
+        await create_weekly_proposals(bot, db)
+        print("[weekly_proposals] Weekly proposal messages created/updated.")
+    except Exception as e:
+        log.error("[weekly_proposals] Failed to create weekly proposals: %s", e)
 
 
 async def deadline_check_job():
@@ -78,7 +85,6 @@ async def deadline_check_job():
     signup_ch_id = db.get_config("signup_channel_id")
     log_ch = bot.get_channel(int(log_ch_id)) if log_ch_id else None
     broadcast_ch = bot.get_channel(int(broadcast_ch_id)) if broadcast_ch_id else None
-    signup_ch_id = db.get_config("signup_channel_id")
     signup_ch = bot.get_channel(int(signup_ch_id)) if signup_ch_id else broadcast_ch
     if not log_ch:
         return
@@ -128,7 +134,6 @@ async def deadline_check_job():
             db.decrement_scheduled_count(match["team_away"])
         db.set_allocation_status(match["id"], "cancelled")
 
-        # Edit the sign-up message
         bcast = db.get_broadcast_message(match["id"])
         if bcast and signup_ch:
             try:
@@ -158,18 +163,6 @@ async def deadline_check_job():
                           match["id"], e)
 
 
-async def daily_sweep_job():
-    teamup = get_teamup()
-    broadcast_ch_id = db.get_config("broadcast_channel_id")
-    signup_ch_id = db.get_config("signup_channel_id")
-    broadcast_ch = bot.get_channel(int(broadcast_ch_id)) if broadcast_ch_id else None
-    signup_ch = bot.get_channel(int(signup_ch_id)) if signup_ch_id else None
-    if teamup and broadcast_ch:
-        await run_daily_sweep(db, teamup, broadcast_ch, signup_channel=signup_ch)
-    else:
-        print("[sweep] Skipped — missing TeamUp credentials or broadcast channel.")
-
-
 GUILD_IDS = [
     1493650865238577172, # user server
     1493657000922451989, # admin server
@@ -180,8 +173,8 @@ GUILD_IDS = [
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    # Re-register persistent sign-up views for all active matches so buttons
-    # keep working after a bot restart.
+
+    # Re-register persistent sign-up views
     from cogs.signup import SignUpView, ApprovedSignUpView
     active_matches = db.get_all_active_sign_up_matches()
     for match in active_matches:
@@ -193,18 +186,29 @@ async def on_ready():
         bot.add_view(ApprovedSignUpView(match["id"]))
     print(f"Registered {len(accepted_matches)} persistent approved sign-up view(s).")
 
-    from cogs.proposal import ProposalView
-    pending_changes = db.get_all_pending_changes()
-    for change in pending_changes:
-        bot.add_view(ProposalView(change["id"]))
-    print(f"Registered {len(pending_changes)} persistent proposal view(s).")
+    # Re-register persistent proposal day views (for open proposals)
+    from cogs.weekly_proposals import ProposalDayView, BlockedDayView
+    open_proposals = db.get_open_proposal_messages()
+    for proposal in open_proposals:
+        date_str = proposal["date"]
+        all_matches = db.get_matches_for_date(date_str)
+        slot1_id = proposal.get("slot1_match_id")
+        slot2_id = proposal.get("slot2_match_id")
+        bot.add_view(ProposalDayView(date_str, all_matches,
+                                    slot1_match_id=slot1_id, slot2_match_id=slot2_id))
+    print(f"Registered {len(open_proposals)} persistent proposal day view(s).")
+    blocked_proposals = db.get_blocked_proposal_messages()
+    for proposal in blocked_proposals:
+        bot.add_view(BlockedDayView(proposal["date"]))
+    print(f"Registered {len(blocked_proposals)} persistent blocked day view(s).")
 
     from cogs.confirm_view import ConfirmationView
     awaiting = db.get_all_awaiting_confirmation_matches()
     for row in awaiting:
         bot.add_view(ConfirmationView(row["match_id"]))
     print(f"Registered {len(awaiting)} persistent confirmation view(s).")
-    # Sync commands to each guild first (instant), then clear global to remove duplicates
+
+    # Sync commands to each guild
     for guild_id in GUILD_IDS:
         guild = discord.Object(id=guild_id)
         bot.tree.copy_global_to(guild=guild)
@@ -227,16 +231,19 @@ async def main():
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN not set in .env")
 
-    scheduler.add_job(daily_sweep_job, "cron", hour=3, minute=0)
-    scheduler.add_job(morning_job, "cron", hour=9, minute=0)     # 9am ET day-of check
-    scheduler.add_job(announce_job, "cron", hour=11, minute=0)   # 11am ET
-    scheduler.add_job(announce_job, "cron", hour=23, minute=0)   # 11pm ET
-    scheduler.add_job(deadline_check_job, "interval", minutes=5, # sign-up deadline check
-                      max_instances=1, coalesce=True)
+    # Scheduled jobs (all Eastern Time, all skipped on Sunday except weekly_proposals)
+    scheduler.add_job(scan_job, "cron", hour=9,  minute=0)     # 9am scan
+    scheduler.add_job(scan_job, "cron", hour=18, minute=0)     # 6pm scan
+    scheduler.add_job(scan_job, "cron", hour=23, minute=59)    # 11:59pm scan
+    scheduler.add_job(weekly_proposals_job, "cron",            # Sunday 11pm proposals
+                      day_of_week="sun", hour=23, minute=0)
+    scheduler.add_job(deadline_check_job, "interval",          # sign-up deadline check
+                      minutes=5, max_instances=1, coalesce=True)
 
     await bot.add_cog(AdminCog(bot, db, get_teamup))
     await bot.add_cog(BlocksCog(bot, db, get_teamup))
     await bot.add_cog(EventsCog(bot, db, get_teamup))
+    await bot.add_cog(WeeklyProposalsCog(bot, db))
 
     try:
         await bot.start(token)

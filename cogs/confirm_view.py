@@ -6,16 +6,13 @@ from scheduler import _SEPARATOR, _CALENDAR_LINK
 
 log = logging.getLogger(__name__)
 
-# Required role keys that must confirm
-_REQUIRED_KEYS = ("producer", "observer", "pbp", "colour")
 _DISPLAY_ORDER = [
-    ("producer",  "Producer"),
-    ("observer",  "Observer"),
-    ("pbp",       "Play-by-Play"),
-    ("colour",    "Colour Caster"),
-    ("host",      "Host"),
-    ("analyst_1", "Analyst"),
-    ("analyst_2", "Analyst"),
+    ("producer",  "Producer",      True),
+    ("observer",  "Observer",      True),
+    ("pbp_1",     "Play-by-Play",  True),
+    ("colour_1",  "Colour Caster", True),
+    ("host",      "Host",          False),
+    ("analyst_1", "Analyst",       False),
 ]
 
 
@@ -32,13 +29,12 @@ def build_confirmation_message(match: dict, role_assignments: dict,
         "",
     ]
 
-    for key, label in _DISPLAY_ORDER:
+    for key, label, required in _DISPLAY_ORDER:
         assignment = role_assignments.get(key)
         if not assignment:
             continue
         uid = assignment["user_id"]
         name = assignment["display_name"]
-        required = key in _REQUIRED_KEYS
         if required:
             status = confirmations.get(uid)
             if status is True:
@@ -53,11 +49,15 @@ def build_confirmation_message(match: dict, role_assignments: dict,
 
     # Awaiting mentions (only required users who haven't responded)
     awaiting = []
-    for key in _REQUIRED_KEYS:
+    seen_awaiting: set[str] = set()
+    for key, _label, required in _DISPLAY_ORDER:
+        if not required:
+            continue
         a = role_assignments.get(key)
         if a:
             uid = a["user_id"]
-            if confirmations.get(uid) is None and uid not in awaiting:
+            if confirmations.get(uid) is None and uid not in seen_awaiting:
+                seen_awaiting.add(uid)
                 awaiting.append(uid)
 
     if awaiting:
