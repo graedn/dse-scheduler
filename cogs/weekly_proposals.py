@@ -24,11 +24,26 @@ PAIR_MIN_H = 2.0  # Minimum gap (hours) between two scheduled matches
 # Helpers
 # ---------------------------------------------------------------------------
 
+_PRIORITY_SLOTS: dict[tuple[int, int], str] = {
+    (19,  0): "⭐ ",
+    (21, 30): "⭐ ",
+    (20,  0): "🌑 ",
+    (22, 30): "🌑 ",
+}
+
+
+def get_priority_label(match_time: int) -> str:
+    """Return a priority emoji prefix for Thu/Fri prime-time slots, else empty string."""
+    dt = datetime.fromtimestamp(match_time, tz=ET)
+    if dt.weekday() not in (3, 4):  # 3=Thursday, 4=Friday
+        return ""
+    return _PRIORITY_SLOTS.get((dt.hour, dt.minute), "")
+
+
 def _match_option_label(match: dict) -> str:
-    dt = datetime.fromtimestamp(match["match_time"], tz=ET)
-    time_str = dt.strftime("%H:%M ET")
     label = (
-        f"[{match['division']}] {match['team_home']} vs {match['team_away']} — {time_str}"
+        f"{get_priority_label(match['match_time'])}"
+        f"[{match['division']}] {match['team_home']} vs {match['team_away']}"
     )
     return label[:100]
 
@@ -82,7 +97,7 @@ def build_proposal_day_content(date_str: str, db) -> str:
         for m in current_matches:
             ts = m["match_time"]
             lines.append(
-                f"• [{m['division']}] {m['team_home']} vs {m['team_away']} — <t:{ts}:t>"
+                f"• {get_priority_label(ts)}[{m['division']}] {m['team_home']} vs {m['team_away']} — <t:{ts}:t>"
             )
     elif status == "blocked":
         lines.append("🚫 Day blocked — NO STREAM")
@@ -94,7 +109,7 @@ def build_proposal_day_content(date_str: str, db) -> str:
         for m in logged_matches:
             ts = m["match_time"]
             lines.append(
-                f"• [{m['division']}] {m['team_home']} vs {m['team_away']} — <t:{ts}:F>"
+                f"• {get_priority_label(ts)}[{m['division']}] {m['team_home']} vs {m['team_away']} — <t:{ts}:F>"
             )
     elif not all_matches:
         lines.append("*No matches logged for this day.*")
