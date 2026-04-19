@@ -18,6 +18,7 @@ from cogs.blocks import BlocksCog
 from cogs.events import EventsCog
 from cogs.talent import send_allocation_request
 from cogs.weekly_proposals import WeeklyProposalsCog, create_weekly_proposals, mark_passed_proposals
+from cogs.threads import ThreadsCog, ReadyCheckView, send_ready_check
 
 load_dotenv()
 ET = ZoneInfo("America/New_York")
@@ -162,6 +163,13 @@ async def deadline_check_job():
                 log.error("Cancel: failed to send log message for match %s: %s",
                           match["id"], e)
 
+    # --- Ready check: accepted matches within 30 min that have a thread ---
+    for match in db.get_approved_matches_needing_ready_check():
+        try:
+            await send_ready_check(bot, match)
+        except Exception as e:
+            log.error("Ready check failed for match %s: %s", match["id"], e)
+
 
 GUILD_IDS = [
     1493650865238577172, # user server
@@ -208,6 +216,12 @@ async def on_ready():
         bot.add_view(ConfirmationView(row["match_id"]))
     print(f"Registered {len(awaiting)} persistent confirmation view(s).")
 
+    # Re-register ReadyCheckViews for threads that have an active ready check
+    pending_rcs = db.get_all_threads_with_pending_ready_check()
+    for row in pending_rcs:
+        bot.add_view(ReadyCheckView(row["match_id"]))
+    print(f"Registered {len(pending_rcs)} persistent ready-check view(s).")
+
     # Sync commands to each guild
     for guild_id in GUILD_IDS:
         guild = discord.Object(id=guild_id)
@@ -244,6 +258,7 @@ async def main():
     await bot.add_cog(BlocksCog(bot, db, get_teamup))
     await bot.add_cog(EventsCog(bot, db, get_teamup))
     await bot.add_cog(WeeklyProposalsCog(bot, db))
+    await bot.add_cog(ThreadsCog(bot, db))
 
     try:
         await bot.start(token)

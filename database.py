@@ -114,6 +114,18 @@ class Database:
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS thread_messages (
+                match_id INTEGER PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                team1_role_id TEXT,
+                team2_role_id TEXT,
+                team1_low_confidence INTEGER NOT NULL DEFAULT 0,
+                team2_low_confidence INTEGER NOT NULL DEFAULT 0,
+                ready_check_message_id TEXT,
+                ready_check_responses TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL
+            );
         """)
         # Migrate existing databases that predate the broadcast_accepted column
         try:
@@ -832,6 +844,109 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    # --- Thread messages ---
+
+    def insert_thread_message(
+        self,
+        match_id: int,
+        thread_id: str,
+        channel_id: str,
+        team1_role_id: Optional[str],
+        team2_role_id: Optional[str],
+        team1_low_confidence: int = 0,
+        team2_low_confidence: int = 0,
+    ) -> None:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO thread_messages "
+            "(match_id, thread_id, channel_id, team1_role_id, team2_role_id, "
+            "team1_low_confidence, team2_low_confidence, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (match_id, thread_id, channel_id, team1_role_id, team2_role_id,
+             team1_low_confidence, team2_low_confidence, int(time.time())),
+        )
+        self.conn.commit()
+
+    def get_thread_message(self, match_id: int) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM thread_messages WHERE match_id = ?", (match_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_thread_by_id(self, thread_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM thread_messages WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_thread_roles(
+        self,
+        match_id: int,
+        team1_role_id: Optional[str],
+        team2_role_id: Optional[str],
+        team1_low_confidence: int,
+        team2_low_confidence: int,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE thread_messages SET team1_role_id = ?, team2_role_id = ?, "
+            "team1_low_confidence = ?, team2_low_confidence = ? WHERE match_id = ?",
+            (team1_role_id, team2_role_id,
+             team1_low_confidence, team2_low_confidence, match_id),
+        )
+        self.conn.commit()
+
+    def set_thread_ready_check_message(self, match_id: int, message_id: str) -> None:
+        self.conn.execute(
+            "UPDATE thread_messages SET ready_check_message_id = ? WHERE match_id = ?",
+            (message_id, match_id),
+        )
+        self.conn.commit()
+
+    def set_thread_ready_check_response(
+        self, match_id: int, user_id: str, ready: bool
+    ) -> None:
+        row = self.conn.execute(
+            "SELECT ready_check_responses FROM thread_messages WHERE match_id = ?",
+            (match_id,),
+        ).fetchone()
+        if not row:
+            return
+        responses: dict = json.loads(row["ready_check_responses"])
+        responses[user_id] = ready
+        self.conn.execute(
+            "UPDATE thread_messages SET ready_check_responses = ? WHERE match_id = ?",
+            (json.dumps(responses), match_id),
+        )
+        self.conn.commit()
+
+    def get_thread_ready_check_responses(self, match_id: int) -> dict:
+        row = self.conn.execute(
+            "SELECT ready_check_responses FROM thread_messages WHERE match_id = ?",
+            (match_id,),
+        ).fetchone()
+        return json.loads(row["ready_check_responses"]) if row else {}
+
+    def get_approved_matches_needing_ready_check(self) -> list[dict]:
+        """Accepted matches whose match_time is within 30 min and have a thread but no ready check."""
+        import time as _time
+        now = int(_time.time())
+        cutoff = now + 30 * 60
+        rows = self.conn.execute(
+            "SELECT m.* FROM matches m "
+            "JOIN thread_messages t ON t.match_id = m.id "
+            "WHERE m.broadcast_accepted = 1 "
+            "AND m.match_time > ? AND m.match_time <= ? "
+            "AND t.ready_check_message_id IS NULL",
+            (now, cutoff),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_threads_with_pending_ready_check(self) -> list[dict]:
+        """All thread rows that have a ready_check_message_id (for persistent view re-registration)."""
+        rows = self.conn.execute(
+            "SELECT * FROM thread_messages WHERE ready_check_message_id IS NOT NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def reset_season(self) -> None:
         """Clear all season data while preserving config and managers."""
         self.conn.executescript("""
@@ -844,6 +959,7 @@ class Database:
             DELETE FROM talent;
             DELETE FROM talent_allocations;
             DELETE FROM proposal_messages;
+            DELETE FROM thread_messages;
             DELETE FROM sqlite_sequence WHERE name IN (
                 'matches', 'pending_changes', 'broadcast_messages',
                 'broadcast_signups', 'talent_allocations', 'proposal_messages'
@@ -867,6 +983,7 @@ class Database:
             DELETE FROM talent_allocations;
             DELETE FROM user_settings;
             DELETE FROM proposal_messages;
+            DELETE FROM thread_messages;
             DELETE FROM sqlite_sequence WHERE name IN (
                 'matches', 'pending_changes', 'broadcast_messages',
                 'broadcast_signups', 'talent_allocations', 'proposal_messages'

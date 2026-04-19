@@ -151,6 +151,18 @@ async def _finalize_match(match: dict, alloc: dict, role_assignments: dict, bot)
             f"{match['team_away']}** — all talent confirmed. {note}"
         )
 
+    from cogs.threads import create_match_thread
+    try:
+        await create_match_thread(bot, match, role_assignments)
+    except Exception as e:
+        log.error("Thread creation failed for match %s: %s", match["id"], e)
+        if log_ch:
+            await log_ch.send(
+                f"⚠️ **Thread creation failed** for "
+                f"**[{match['division']}] {match['team_home']} vs {match['team_away']}**.\n"
+                f"Use **Create Thread** on the sign-up message to retry."
+            )
+
 
 class ReadyButton(discord.ui.Button):
     def __init__(self, match_id: int):

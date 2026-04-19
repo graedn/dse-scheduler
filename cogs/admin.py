@@ -298,8 +298,10 @@ class AdminCog(commands.Cog):
         log_ch = self.db.get_config("log_channel_id")
         proposal_ch = self.db.get_config("proposal_channel_id")
         updates_ch = self.db.get_config("schedule_updates_channel_id")
+        thread_ch = self.db.get_config("thread_channel_id")
         talent_role = self.db.get_config("talent_role_id")
         manager_role = self.db.get_config("manager_role_id")
+        league_admin_role = self.db.get_config("league_admin_role_id")
         calendar_id = self.db.get_config("teamup_calendar_id")
         api_key = self.db.get_config("teamup_api_key")
 
@@ -317,8 +319,10 @@ class AdminCog(commands.Cog):
             f"Log channel: {ch_str(log_ch)}",
             f"Proposal channel: {ch_str(proposal_ch)}",
             f"Schedule updates channel: {ch_str(updates_ch)}",
+            f"Thread channel: {ch_str(thread_ch)}",
             f"Talent role: {role_str(talent_role)}",
             f"Manager role: {role_str(manager_role)}",
+            f"League Admin role: {role_str(league_admin_role)}",
             f"TeamUp calendar: {'✅ Set' if calendar_id else '❌ Not set'}",
             f"TeamUp API key: {'✅ Set' if api_key else '❌ Not set'}",
         ]
@@ -664,6 +668,64 @@ class AdminCog(commands.Cog):
             summary += f" ({failed} deletion(s) failed — remove manually.)"
         await interaction.followup.send(
             f"✅ Bot has been reset to its original state.\n{summary}", ephemeral=True
+        )
+
+    # ------------------------------------------------------------------
+    # Thread channel and League Admin role config (admin-only)
+    # ------------------------------------------------------------------
+
+    @app_commands.command(name="set-thread-channel",
+                          description="Set the channel where match threads are created")
+    async def set_thread_channel(self, interaction: discord.Interaction,
+                                  channel: discord.TextChannel):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.set_config("thread_channel_id", str(channel.id))
+        await interaction.response.send_message(
+            f"✅ Thread channel set to {channel.mention}", ephemeral=True
+        )
+
+    @app_commands.command(name="unset-thread-channel",
+                          description="Remove the thread channel configuration")
+    async def unset_thread_channel(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.delete_config("thread_channel_id")
+        await interaction.response.send_message(
+            "✅ Thread channel unlinked.", ephemeral=True
+        )
+
+    @app_commands.command(name="add-league-admin-role",
+                          description="Set the League Admin role used in broadcast threads and ready checks")
+    async def add_league_admin_role(self, interaction: discord.Interaction,
+                                    role: discord.Role):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.set_config("league_admin_role_id", str(role.id))
+        await interaction.response.send_message(
+            f"✅ League Admin role set to **{role.name}**.", ephemeral=True
+        )
+
+    @app_commands.command(name="remove-league-admin-role",
+                          description="Remove the League Admin role configuration")
+    async def remove_league_admin_role(self, interaction: discord.Interaction):
+        if not self._admin_check(interaction):
+            await interaction.response.send_message(
+                "Administrator permission required.", ephemeral=True
+            )
+            return
+        self.db.delete_config("league_admin_role_id")
+        await interaction.response.send_message(
+            "✅ League Admin role cleared.", ephemeral=True
         )
 
     # ------------------------------------------------------------------
