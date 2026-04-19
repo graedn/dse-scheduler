@@ -359,6 +359,36 @@ def test_increment_talent_broadcast_upserts(db):
     assert db.get_talent_count("uid-1") == 2
 
 
+def test_increment_talent_unavailable_creates_and_increments(db):
+    db.increment_talent_unavailable("uid-1", "user#1", "Alice")
+    rows = db.get_all_talent()
+    assert any(r["user_id"] == "uid-1" and r["unavailable_count"] == 1 for r in rows)
+    db.increment_talent_unavailable("uid-1", "user#1", "Alice")
+    rows = db.get_all_talent()
+    assert any(r["user_id"] == "uid-1" and r["unavailable_count"] == 2 for r in rows)
+
+
+def test_increment_talent_unavailable_does_not_touch_broadcast_count(db):
+    db.increment_talent_broadcast("uid-1", "user#1", "Alice")
+    db.increment_talent_unavailable("uid-1", "user#1", "Alice")
+    assert db.get_talent_count("uid-1") == 1   # broadcast count unchanged
+    rows = db.get_all_talent()
+    row = next(r for r in rows if r["user_id"] == "uid-1")
+    assert row["unavailable_count"] == 1
+
+
+def test_remove_all_signups_for_user(db):
+    mid = db.insert_match("Premier", "Week 1", "A", "B", 1700000000, 1699990000)
+    db.upsert_signup(mid, "m1", "producer", "uid-1", "u1", "Alice")
+    db.upsert_signup(mid, "m1", "pbp",      "uid-1", "u1", "Alice")
+    db.upsert_signup(mid, "m1", "observer", "uid-2", "u2", "Bob")
+    db.remove_all_signups_for_user(mid, "uid-1")
+    signups = db.get_signups_for_match(mid)
+    user_ids = {s["user_id"] for s in signups}
+    assert "uid-1" not in user_ids
+    assert "uid-2" in user_ids
+
+
 # --- Talent allocations ---
 
 def test_create_and_get_allocation(db):

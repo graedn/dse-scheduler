@@ -1,21 +1,18 @@
-"""Tests for schedule_for_date() and _schedule_for_date_locked() (H3).
+"""Tests for the new proposal-based scheduling flow.
 
-Patches accept_combination and propose_change so no Discord or TeamUp calls
-are made. Uses a real in-memory Database for match/blocked-day state.
+The old auto-scheduling (schedule_for_date, propose_change, apply_pending_change)
+has been removed.  Scheduling is now done explicitly by managers via the weekly
+proposal messages.  These tests cover the proposal_messages DB layer and the
+match-logging flow in EventsCog.
 """
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+import time
 from database import Database
-from scheduler import schedule_for_date
 
-# Saturday 2024-04-20 timestamps in ET (same as test_scheduler.py)
-TS_6PM  = 1713650400
-TS_8PM  = 1713657600
-TS_10PM = 1713664800
-TS_11PM = 1713668400  # 1h past 10pm — outside the 2h window
-
-
-DATE = "2024-04-20"
+# Saturday 2099-04-20 timestamps (far future so they won't expire)
+TS_8PM  = 4071974400   # approximate — exact value doesn't matter for these tests
+DATE    = "2099-04-20"
+WEEK_START = "2099-04-18"  # Monday of that week
 
 
 @pytest.fixture
@@ -25,7 +22,7 @@ def db():
     d.close()
 
 
-def _insert_match(db, ts, mid=None, home="Team A", away="Team B", division="Premier"):
+def _insert_match(db, ts=TS_8PM, home="Team A", away="Team B", division="Premier"):
     return db.insert_match(
         division=division,
         week="Week 1",
@@ -37,171 +34,146 @@ def _insert_match(db, ts, mid=None, home="Team A", away="Team B", division="Prem
 
 
 # ---------------------------------------------------------------------------
-# Blocked day
+# proposal_messages DB layer
 # ---------------------------------------------------------------------------
 
-async def test_schedule_blocked_day_does_nothing(db):
-    db.insert_blocked_day(DATE, reason="Test block", teamup_event_id=None)
-    _insert_match(db, TS_8PM)
+def test_create_proposal_message(db):
+    now = int(time.time())
+    row_id = db.create_proposal_message(DATE, TS_8PM, WEEK_START)
+    assert row_id is not None
 
-    with patch("scheduler.accept_combination", new_callable=AsyncMock) as mock_accept, \
-         patch("scheduler.propose_change",     new_callable=AsyncMock) as mock_propose:
-        await schedule_for_date(DATE, db, MagicMock(), MagicMock())
-
-    mock_accept.assert_not_called()
-    mock_propose.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# No unscheduled matches
-# ---------------------------------------------------------------------------
-
-async def test_schedule_all_matches_already_scheduled_does_nothing(db):
-    mid = _insert_match(db, TS_8PM)
-    db.update_match_teamup_id(mid, "evt_existing")
-
-    with patch("scheduler.accept_combination", new_callable=AsyncMock) as mock_accept:
-        await schedule_for_date(DATE, db, MagicMock(), MagicMock())
-
-    mock_accept.assert_not_called()
+    row = db.get_proposal_message(DATE)
+    assert row is not None
+    assert row["date"] == DATE
+    assert row["week_start"] == WEEK_START
+    assert row["day_ts"] == TS_8PM
+    assert row["status"] == "open"
+    assert row["slot1_match_id"] is None
+    assert row["slot2_match_id"] is None
 
 
-# ---------------------------------------------------------------------------
-# Direct add: first match on an empty day
-# ---------------------------------------------------------------------------
-
-async def test_schedule_first_match_direct_add(db):
-    mid = _insert_match(db, TS_8PM)
-
-    teamup  = MagicMock()
-    signup  = AsyncMock()
-
-    with patch("scheduler.accept_combination", new_callable=AsyncMock) as mock_accept:
-        await schedule_for_date(DATE, db, teamup, MagicMock(), signup_channel=signup)
-
-    mock_accept.assert_called_once()
-    called_combo = mock_accept.call_args[0][0]
-    assert called_combo[0]["id"] == mid
+def test_create_proposal_message_idempotent(db):
+    """Creating a proposal message for the same date twice is a no-op (INSERT OR IGNORE)."""
+    db.create_proposal_message(DATE, TS_8PM, WEEK_START)
+    db.create_proposal_message(DATE, TS_8PM + 999, WEEK_START)  # different day_ts, same date
+    row = db.get_proposal_message(DATE)
+    assert row["day_ts"] == TS_8PM  # first value kept
 
 
-# ---------------------------------------------------------------------------
-# Direct add: second match within the ~2h window
-# ---------------------------------------------------------------------------
-
-async def test_schedule_second_match_within_window_direct_add(db):
-    # Simulate a proposed match at 8pm already on the calendar
-    mid1 = _insert_match(db, TS_8PM, home="Team A", away="Team B")
-    db.update_match_teamup_id(mid1, "evt_8pm")
-    db.increment_scheduled_count("Team A")
-    db.increment_scheduled_count("Team B")
-
-    # New match at 10pm — exactly 2h later, within the window
-    mid2 = _insert_match(db, TS_10PM, home="Team C", away="Team D")
-
-    with patch("scheduler.accept_combination", new_callable=AsyncMock) as mock_accept:
-        await schedule_for_date(DATE, db, MagicMock(), MagicMock())
-
-    mock_accept.assert_called_once()
-    called_combo = mock_accept.call_args[0][0]
-    assert called_combo[0]["id"] == mid2
+def test_get_proposal_message_missing_returns_none(db):
+    assert db.get_proposal_message("2099-01-01") is None
 
 
-# ---------------------------------------------------------------------------
-# Not direct-added: match too far outside the window
-# ---------------------------------------------------------------------------
+def test_update_proposal_slots(db):
+    mid1 = _insert_match(db, TS_8PM)
+    mid2 = _insert_match(db, TS_8PM + 7200, "C", "D")
+    db.create_proposal_message(DATE, TS_8PM, WEEK_START)
 
-async def test_schedule_match_outside_window_not_direct_added(db):
-    # Proposed match at 8pm
-    mid1 = _insert_match(db, TS_8PM, home="Team A", away="Team B")
-    db.update_match_teamup_id(mid1, "evt_8pm")
-
-    # New match at 11pm — 3h later, outside the ±2h window
-    mid2 = _insert_match(db, TS_11PM, home="Team C", away="Team D")
-
-    with patch("scheduler.accept_combination", new_callable=AsyncMock) as mock_accept, \
-         patch("scheduler.propose_change",     new_callable=AsyncMock) as mock_propose:
-        await schedule_for_date(DATE, db, MagicMock(), MagicMock())
-
-    mock_accept.assert_not_called()
+    db.update_proposal_slots(DATE, mid1, mid2)
+    row = db.get_proposal_message(DATE)
+    assert row["slot1_match_id"] == mid1
+    assert row["slot2_match_id"] == mid2
 
 
-# ---------------------------------------------------------------------------
-# Not direct-added: match too close (overlap guard)
-# ---------------------------------------------------------------------------
+def test_update_proposal_slots_can_clear(db):
+    mid1 = _insert_match(db)
+    db.create_proposal_message(DATE, TS_8PM, WEEK_START)
+    db.update_proposal_slots(DATE, mid1, None)
 
-async def test_schedule_overlapping_match_not_direct_added(db):
-    # Proposed match at 8pm
-    mid1 = _insert_match(db, TS_8PM, home="Team A", away="Team B")
-    db.update_match_teamup_id(mid1, "evt_8pm")
+    db.update_proposal_slots(DATE, None, None)
+    row = db.get_proposal_message(DATE)
+    assert row["slot1_match_id"] is None
+    assert row["slot2_match_id"] is None
 
-    # New match 30 minutes later — inside the 1.5h overlap guard
-    mid2 = _insert_match(db, TS_8PM + 1800, home="Team C", away="Team D")
 
-    with patch("scheduler.accept_combination", new_callable=AsyncMock) as mock_accept:
-        await schedule_for_date(DATE, db, MagicMock(), MagicMock())
+def test_set_proposal_status(db):
+    db.create_proposal_message(DATE, TS_8PM, WEEK_START)
 
-    mock_accept.assert_not_called()
+    db.set_proposal_status(DATE, "blocked")
+    assert db.get_proposal_message(DATE)["status"] == "blocked"
+
+    db.set_proposal_status(DATE, "passed")
+    assert db.get_proposal_message(DATE)["status"] == "passed"
+
+
+def test_set_proposal_discord_message(db):
+    db.create_proposal_message(DATE, TS_8PM, WEEK_START)
+    db.set_proposal_discord_message(DATE, "msg_111", "ch_222")
+
+    row = db.get_proposal_message(DATE)
+    assert row["discord_message_id"] == "msg_111"
+    assert row["channel_id"] == "ch_222"
+
+
+def test_get_proposal_messages_for_week(db):
+    db.create_proposal_message("2099-04-21", TS_8PM,         WEEK_START)
+    db.create_proposal_message("2099-04-22", TS_8PM + 86400, WEEK_START)
+    db.create_proposal_message("2099-04-23", TS_8PM + 86400 * 2, "2099-04-25")  # different week
+
+    rows = db.get_proposal_messages_for_week(WEEK_START)
+    assert len(rows) == 2
+    assert all(r["week_start"] == WEEK_START for r in rows)
+
+
+def test_get_open_proposal_messages(db):
+    db.create_proposal_message("2099-04-21", TS_8PM, WEEK_START)
+    db.create_proposal_message("2099-04-22", TS_8PM, WEEK_START)
+    db.set_proposal_status("2099-04-22", "blocked")
+
+    open_rows = db.get_open_proposal_messages()
+    assert len(open_rows) == 1
+    assert open_rows[0]["date"] == "2099-04-21"
+
+
+def test_get_blocked_proposal_messages(db):
+    """get_blocked_proposal_messages returns only 'blocked' proposals."""
+    db.create_proposal_message("2099-04-21", TS_8PM, WEEK_START)
+    db.create_proposal_message("2099-04-22", TS_8PM, WEEK_START)
+    db.create_proposal_message("2099-04-23", TS_8PM, WEEK_START)
+    db.set_proposal_status("2099-04-22", "blocked")
+    db.set_proposal_status("2099-04-23", "passed")
+
+    blocked = db.get_blocked_proposal_messages()
+    assert len(blocked) == 1
+    assert blocked[0]["date"] == "2099-04-22"
 
 
 # ---------------------------------------------------------------------------
-# Proposal: leftover + better combo available
+# get_unscheduled_matches_for_date
 # ---------------------------------------------------------------------------
 
-async def test_schedule_proposal_when_better_combo_exists(db):
-    # Proposed match at 6pm (mediocre slot)
-    mid1 = _insert_match(db, TS_6PM, home="Team A", away="Team B")
-    db.update_match_teamup_id(mid1, "evt_6pm")
+def test_get_unscheduled_matches_for_date_returns_unscheduled(db):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+    # Use a real ET midnight for 2099-04-20 so _et_day_range works
+    day_start = int(datetime(2099, 4, 20, 0, 0, 0, tzinfo=ET).timestamp())
+    day_8pm   = int(datetime(2099, 4, 20, 20, 0, 0, tzinfo=ET).timestamp())
+    day_10pm  = int(datetime(2099, 4, 20, 22, 0, 0, tzinfo=ET).timestamp())
 
-    # Unscheduled match at 8pm — combined with mid3 at 10pm would score higher
-    mid2 = _insert_match(db, TS_8PM, home="Team C", away="Team D")
-    mid3 = _insert_match(db, TS_10PM, home="Team E", away="Team F")
+    mid1 = db.insert_match("Premier", "1", "A", "B", day_8pm, day_8pm - 3600)
+    mid2 = db.insert_match("Premier", "1", "C", "D", day_10pm, day_10pm - 3600)
+    db.update_match_teamup_id(mid1, "evt_abc")   # scheduled
 
-    teamup = MagicMock()
-
-    # accept_combination is called for mid2 (direct add, within 2h of 6pm? No —
-    # 8pm is 2h from 6pm so it qualifies; 10pm is 4h from 6pm so it doesn't).
-    # After mid2 is added, mid3 is 2h from mid2 so it also direct-adds.
-    # We mainly assert no exception and both paths are exercised.
-    with patch("scheduler.accept_combination", new_callable=AsyncMock), \
-         patch("scheduler.propose_change",     new_callable=AsyncMock) as mock_propose:
-        await schedule_for_date(DATE, db, teamup, MagicMock(), log_channel=MagicMock())
-
-    # No assertion on mock_propose being called — whether a proposal fires depends
-    # on the scoring. The important thing is the function runs end-to-end without error.
+    result = db.get_unscheduled_matches_for_date("2099-04-20")
+    ids = [r["id"] for r in result]
+    assert mid1 not in ids   # already scheduled
+    assert mid2 in ids        # not yet scheduled
 
 
 # ---------------------------------------------------------------------------
-# No teamup configured: logs warning instead of adding to calendar
+# reset_season clears proposal_messages
 # ---------------------------------------------------------------------------
 
-async def test_schedule_no_teamup_logs_warning(db):
-    _insert_match(db, TS_8PM)
-    log_ch = AsyncMock()
+def test_reset_season_clears_proposal_messages(db):
+    db.create_proposal_message(DATE, TS_8PM, WEEK_START)
+    assert db.get_proposal_message(DATE) is not None
 
-    with patch("scheduler.accept_combination", new_callable=AsyncMock) as mock_accept:
-        await schedule_for_date(DATE, db, teamup=None, broadcast_channel=MagicMock(),
-                                log_channel=log_ch)
-
-    mock_accept.assert_not_called()
-    log_ch.send.assert_called_once()
-    msg = log_ch.send.call_args[0][0]
-    assert "TeamUp not configured" in msg
+    db.reset_season()
+    assert db.get_proposal_message(DATE) is None
 
 
-# ---------------------------------------------------------------------------
-# Lock prevents concurrent scheduling for the same date
-# ---------------------------------------------------------------------------
-
-async def test_schedule_lock_prevents_race():
-    """Two concurrent calls for the same date should both complete without deadlock."""
-    import asyncio
-    db_mock = MagicMock()
-    db_mock.get_blocked_day.return_value = None
-    db_mock.get_matches_for_date.return_value = []
-
-    with patch("scheduler.accept_combination", new_callable=AsyncMock):
-        await asyncio.gather(
-            schedule_for_date(DATE, db_mock, None, None),
-            schedule_for_date(DATE, db_mock, None, None),
-        )
-    # If this returns without deadlock or exception, the lock works correctly.
+def test_reset_all_clears_proposal_messages(db):
+    db.create_proposal_message(DATE, TS_8PM, WEEK_START)
+    db.reset_all()
+    assert db.get_proposal_message(DATE) is None

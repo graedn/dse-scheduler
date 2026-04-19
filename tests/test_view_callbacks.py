@@ -58,10 +58,8 @@ def _setup_allocation(db, match_id, role_assignments,
                       status="awaiting_confirm",
                       conf_msg_id="10001", conf_ch_id="999"):
     """Insert allocation with given role assignments and null confirmations."""
-    required_ids = {
-        v["user_id"] for k, v in role_assignments.items()
-        if k in ("producer", "observer", "pbp", "colour") and isinstance(v, dict)
-    }
+    from cogs.talent import _get_required_user_ids
+    required_ids = _get_required_user_ids(role_assignments)
     confirmations = {uid: None for uid in required_ids}
     db.create_allocation(match_id)
     db.set_allocation_assignments(
@@ -75,13 +73,13 @@ def _setup_allocation(db, match_id, role_assignments,
     return confirmations
 
 
-# Three-user crew: u1=producer+observer, u2=pbp, u3=colour
+# Three-user crew: u1=producer+observer, u2=pbp_1, u3=colour_1
 def _role_assignments(u1="1", u2="2", u3="3"):
     return {
         "producer": {"user_id": u1, "username": f"u{u1}", "display_name": f"User{u1}"},
         "observer": {"user_id": u1, "username": f"u{u1}", "display_name": f"User{u1}"},
-        "pbp":      {"user_id": u2, "username": f"u{u2}", "display_name": f"User{u2}"},
-        "colour":   {"user_id": u3, "username": f"u{u3}", "display_name": f"User{u3}"},
+        "pbp_1":    {"user_id": u2, "username": f"u{u2}", "display_name": f"User{u2}"},
+        "colour_1": {"user_id": u3, "username": f"u{u3}", "display_name": f"User{u3}"},
     }
 
 
@@ -276,18 +274,151 @@ class TestFinalizeMatch:
 
 
 # ===========================================================================
-# M9 — _ConfirmButton (AllocationView)
+# M9 — _ContinueButton (Phase 1 validation) and _ConfirmButton (Phase 2)
 # ===========================================================================
 
-class TestConfirmButton:
+def _make_phase1_view(db, match, signups):
+    from cogs.talent import AllocationView
+    return AllocationView(
+        match=match, signups=signups, db=db,
+        broadcast_channel=AsyncMock(),
+        log_channel=AsyncMock(),
+        get_teamup=lambda: MagicMock(),
+    )
+
+
+def _make_phase2_view(db, match, signups, required_selections):
+    from cogs.talent import AllocationConfirmView
+    return AllocationConfirmView(
+        match=match, signups=signups, db=db,
+        broadcast_channel=AsyncMock(),
+        log_channel=AsyncMock(),
+        get_teamup=lambda: MagicMock(),
+        required_selections=required_selections,
+    )
+
+
+class TestContinueButton:
+    """Phase 1 validation — _ContinueButton rejects bad role selections."""
+
     def _view_and_button(self, db, match, signups):
-        from cogs.talent import AllocationView, _ConfirmButton
-        view = AllocationView(
-            match=match, signups=signups, db=db,
-            broadcast_channel=AsyncMock(),
-            log_channel=AsyncMock(),
-            get_teamup=lambda: MagicMock(),
-        )
+        from cogs.talent import _ContinueButton
+        view = _make_phase1_view(db, match, signups)
+        button = next(c for c in view.children if isinstance(c, _ContinueButton))
+        return view, button
+
+    async def test_missing_required_role_rejected(self, db):
+        match_id = _insert_match(db)
+        db.upsert_signup(match_id, "m1", "pbp", "2", "u2", "User2")
+        signups = db.get_signups_for_match(match_id)
+        match = db.get_match(match_id)
+        view, button = self._view_and_button(db, match, signups)
+        # No selections made
+
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert "select" in interaction.response.send_message.call_args[0][0].lower()
+
+    async def test_pbp_colour_overlap_rejected(self, db):
+        """Same user as both PBP and Colour is rejected at the Continue step."""
+        match_id = _insert_match(db)
+        for role, uid in [("pbp","2"),("colour","3"),("producer","1"),("observer","4")]:
+            db.upsert_signup(match_id, "m1", role, uid, f"u{uid}", f"User{uid}")
+        signups = db.get_signups_for_match(match_id)
+        match = db.get_match(match_id)
+        view, button = self._view_and_button(db, match, signups)
+        view.selections = {"producer": "1", "observer": "4", "pbp": "2", "colour": "2"}
+
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_called_once()
+        msg = interaction.response.send_message.call_args[0][0].lower()
+        assert "same person" in msg or "colour caster" in msg
+
+    async def test_producer_in_casters_rejected(self, db):
+        """Producer also selected as PBP is rejected at Continue."""
+        match_id = _insert_match(db)
+        for role, uid in [("producer","1"),("observer","4"),("pbp","2"),("colour","3")]:
+            db.upsert_signup(match_id, "m1", role, uid, f"u{uid}", f"User{uid}")
+        signups = db.get_signups_for_match(match_id)
+        match = db.get_match(match_id)
+        view, button = self._view_and_button(db, match, signups)
+        view.selections = {"producer": "1", "observer": "4", "pbp": "1", "colour": "3"}
+
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert "producer" in interaction.response.send_message.call_args[0][0].lower()
+
+    async def test_observer_in_casters_rejected(self, db):
+        """Observer also selected as Colour is rejected at Continue."""
+        match_id = _insert_match(db)
+        for role, uid in [("producer","1"),("observer","4"),("pbp","2"),("colour","3")]:
+            db.upsert_signup(match_id, "m1", role, uid, f"u{uid}", f"User{uid}")
+        signups = db.get_signups_for_match(match_id)
+        match = db.get_match(match_id)
+        view, button = self._view_and_button(db, match, signups)
+        view.selections = {"producer": "1", "observer": "4", "pbp": "2", "colour": "4"}
+
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_called_once()
+        assert "observer" in interaction.response.send_message.call_args[0][0].lower()
+
+    async def test_non_manager_denied(self, db):
+        match_id = _insert_match(db)
+        match = db.get_match(match_id)
+        view, button = self._view_and_button(db, match, [])
+
+        interaction = _make_interaction(db, user_id="1", is_admin=False)
+        interaction.guild = MagicMock()
+        db.is_manager = MagicMock(return_value=False)
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_called_once()
+        msg = interaction.response.send_message.call_args[0][0]
+        assert "manager" in msg.lower() or "administrator" in msg.lower()
+
+    async def test_valid_selections_advance_to_phase2(self, db):
+        """All valid required selections → message edited with AllocationConfirmView."""
+        match_id = _insert_match(db)
+        for role, uid in [("producer","1"),("observer","2"),("pbp","3"),("colour","4")]:
+            db.upsert_signup(match_id, "m1", role, uid, f"u{uid}", f"User{uid}")
+        signups = db.get_signups_for_match(match_id)
+        match = db.get_match(match_id)
+        view, button = self._view_and_button(db, match, signups)
+        view.selections = {"producer": "1", "observer": "2", "pbp": "3", "colour": "4"}
+
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+        await button.callback(interaction)
+
+        # Should not error — should edit message to phase 2 view
+        interaction.response.send_message.assert_not_called()
+        interaction.response.edit_message.assert_called_once()
+        from cogs.talent import AllocationConfirmView
+        view_arg = interaction.response.edit_message.call_args[1]["view"]
+        assert isinstance(view_arg, AllocationConfirmView)
+
+
+class TestConfirmButton:
+    """Phase 2 confirmation — _ConfirmButton stores allocation and triggers confirmation."""
+
+    def _view_and_button(self, db, match, signups, required_selections=None):
+        from cogs.talent import _ConfirmButton
+        if required_selections is None:
+            required_selections = {"producer": "1", "observer": "2",
+                                   "pbp": "3", "colour": "4"}
+        view = _make_phase2_view(db, match, signups, required_selections)
         button = next(c for c in view.children if isinstance(c, _ConfirmButton))
         return view, button
 
@@ -298,50 +429,189 @@ class TestConfirmButton:
 
         interaction = _make_interaction(db, user_id="1", is_admin=False)
         interaction.guild = MagicMock()
-        db.add_manager = MagicMock(return_value=None)
         db.is_manager = MagicMock(return_value=False)
-
         await button.callback(interaction)
 
         interaction.response.send_message.assert_called_once()
         msg = interaction.response.send_message.call_args[0][0]
         assert "manager" in msg.lower() or "administrator" in msg.lower()
 
-    async def test_missing_required_role_rejected(self, db):
+    async def test_allocation_stored_with_correct_keys(self, db):
+        """Confirm writes pbp_1 and colour_1 (single-select) to role_assignments."""
         match_id = _insert_match(db)
-        db.update_match_teamup_id(match_id, "evt_test")  # guard: match must be on calendar
-        db.upsert_signup(match_id, "m1", "pbp", "2", "u2", "User2")
-        signups = db.get_signups_for_match(match_id)
-        match = db.get_match(match_id)
-        view, button = self._view_and_button(db, match, signups)
-
-        interaction = _make_interaction(db, user_id="1", is_admin=True)
-        interaction.guild = MagicMock()
-
-        await button.callback(interaction)
-
-        interaction.response.send_message.assert_called_once()
-        assert "select" in interaction.response.send_message.call_args[0][0].lower()
-
-    async def test_two_pbp_rejected(self, db):
-        match_id = _insert_match(db)
-        db.update_match_teamup_id(match_id, "evt_test")  # guard: match must be on calendar
-        for role, uid in [("pbp","2"),("colour","3"),("producer","1"),("observer","1")]:
+        db.update_match_teamup_id(match_id, "evt_test")
+        db.create_allocation(match_id)
+        for role, uid in [("producer","1"),("observer","2"),("pbp","3"),("colour","4")]:
             db.upsert_signup(match_id, "m1", role, uid, f"u{uid}", f"User{uid}")
         signups = db.get_signups_for_match(match_id)
         match = db.get_match(match_id)
-        view, button = self._view_and_button(db, match, signups)
-        view.selections = {"producer": "1", "observer": "1"}
-        view.caster_selections = ["pbp:2", "pbp:3"]   # two PBP — invalid
-        view.optional_selections = []
+        req = {"producer": "1", "observer": "2", "pbp": "3", "colour": "4"}
+        view, button = self._view_and_button(db, match, signups, req)
 
         interaction = _make_interaction(db, user_id="1", is_admin=True)
         interaction.guild = MagicMock()
-
         await button.callback(interaction)
 
-        interaction.response.send_message.assert_called_once()
-        assert "two" in interaction.response.send_message.call_args[0][0].lower()
+        interaction.response.send_message.assert_not_called()
+        import json
+        alloc = db.get_allocation(match_id)
+        ra = json.loads(alloc["role_assignments"])
+        assert ra["pbp_1"]["user_id"] == "3"
+        assert ra["colour_1"]["user_id"] == "4"
+        assert "pbp_2" not in ra
+        assert "colour_2" not in ra
+
+    async def test_host_analyst_via_optional_selections(self, db):
+        """Host and Analyst appear in allocation when set via optional_selections."""
+        match_id = _insert_match(db)
+        db.update_match_teamup_id(match_id, "evt_test")
+        db.create_allocation(match_id)
+        for role, uid in [("producer","1"),("observer","2"),("pbp","3"),("colour","4"),
+                          ("host","5"),("analyst","6")]:
+            db.upsert_signup(match_id, "m1", role, uid, f"u{uid}", f"User{uid}")
+        signups = db.get_signups_for_match(match_id)
+        match = db.get_match(match_id)
+        req = {"producer": "1", "observer": "2", "pbp": "3", "colour": "4"}
+        view, button = self._view_and_button(db, match, signups, req)
+        view.optional_selections = {"host": "5", "analyst": "6"}
+
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+        await button.callback(interaction)
+
+        import json
+        alloc = db.get_allocation(match_id)
+        ra = json.loads(alloc["role_assignments"])
+        assert ra.get("host", {}).get("user_id") == "5"
+        assert ra.get("analyst_1", {}).get("user_id") == "6"
+
+
+# ===========================================================================
+# Confirm message / talent description builders
+# ===========================================================================
+
+class TestBuildConfirmationMessage:
+    def _ra(self):
+        return {
+            "producer":  {"user_id": "1", "username": "u1", "display_name": "Alice"},
+            "observer":  {"user_id": "2", "username": "u2", "display_name": "Bob"},
+            "pbp_1":     {"user_id": "3", "username": "u3", "display_name": "Carol"},
+            "colour_1":  {"user_id": "4", "username": "u4", "display_name": "Dave"},
+            "host":      {"user_id": "5", "username": "u5", "display_name": "Eve"},
+        }
+
+    def _match(self):
+        return {"division": "Premier", "team_home": "A", "team_away": "B", "match_time": 1700000000}
+
+    def test_shows_all_required_roles(self):
+        from cogs.confirm_view import build_confirmation_message
+        ra = self._ra()
+        confs = {"1": None, "2": None, "3": None, "4": None}
+        content = build_confirmation_message(self._match(), ra, confs)
+        assert "Alice" in content
+        assert "Bob" in content
+        assert "Carol" in content
+        assert "Dave" in content
+        assert "No Response" in content
+
+    def test_shows_optional_host_without_status(self):
+        from cogs.confirm_view import build_confirmation_message
+        ra = self._ra()
+        confs = {"1": None, "2": None, "3": None, "4": None}
+        content = build_confirmation_message(self._match(), ra, confs)
+        # Host is optional — should not show [No Response]
+        lines = [l for l in content.splitlines() if "Eve" in l]
+        assert lines
+        assert "No Response" not in lines[0]
+        assert "optional" in lines[0].lower()
+
+    def test_shows_single_pbp_and_colour(self):
+        from cogs.confirm_view import build_confirmation_message
+        ra = {
+            "producer":  {"user_id": "1", "username": "u1", "display_name": "Alice"},
+            "observer":  {"user_id": "2", "username": "u2", "display_name": "Bob"},
+            "pbp_1":     {"user_id": "3", "username": "u3", "display_name": "Carol"},
+            "colour_1":  {"user_id": "4", "username": "u4", "display_name": "Dave"},
+        }
+        confs = {"1": None, "2": None, "3": None, "4": None}
+        content = build_confirmation_message(self._match(), ra, confs)
+        assert "Carol" in content
+        assert "Dave" in content
+
+    def test_awaiting_deduplicates_same_user(self):
+        from cogs.confirm_view import build_confirmation_message
+        # u1 fills both producer and observer — should appear once in awaiting
+        ra = {
+            "producer":  {"user_id": "1", "username": "u1", "display_name": "Alice"},
+            "observer":  {"user_id": "1", "username": "u1", "display_name": "Alice"},
+            "pbp_1":     {"user_id": "2", "username": "u2", "display_name": "Bob"},
+            "colour_1":  {"user_id": "3", "username": "u3", "display_name": "Carol"},
+        }
+        confs = {"1": None, "2": True, "3": True}
+        content = build_confirmation_message(self._match(), ra, confs)
+        # <@1> should appear only once in the awaiting section
+        awaiting_section = content.split("Awaiting")[-1] if "Awaiting" in content else ""
+        assert awaiting_section.count("<@1>") == 1
+
+    def test_ready_status_shown(self):
+        from cogs.confirm_view import build_confirmation_message
+        ra = self._ra()
+        confs = {"1": True, "2": None, "3": None, "4": None}
+        content = build_confirmation_message(self._match(), ra, confs)
+        assert "[Ready]" in content
+
+
+class TestBuildTalentDescription:
+    def test_required_roles_displayed(self):
+        from cogs.talent import build_talent_description_from_assignments
+        ra = {
+            "producer":  {"user_id": "1", "username": "u1", "display_name": "Alice"},
+            "observer":  {"user_id": "2", "username": "u2", "display_name": "Bob"},
+            "pbp_1":     {"user_id": "3", "username": "u3", "display_name": "Carol"},
+            "colour_1":  {"user_id": "4", "username": "u4", "display_name": "Dave"},
+        }
+        desc = build_talent_description_from_assignments(ra)
+        assert "Alice" in desc
+        assert "Carol" in desc
+        assert "Dave" in desc
+        assert "Play-by-Play" in desc
+        assert "Colour Caster" in desc
+
+    def test_missing_slots_omitted(self):
+        from cogs.talent import build_talent_description_from_assignments
+        ra = {
+            "producer": {"user_id": "1", "username": "u1", "display_name": "Alice"},
+            "pbp_1":    {"user_id": "2", "username": "u2", "display_name": "Bob"},
+        }
+        desc = build_talent_description_from_assignments(ra)
+        assert "Alice" in desc
+        assert "Bob" in desc
+        # colour and observer not in ra — should not appear
+        assert "Colour" not in desc
+        assert "Observer" not in desc
+
+
+class TestGetRequiredUserIds:
+    def test_collects_four_required_roles(self):
+        from cogs.talent import _get_required_user_ids
+        ra = {
+            "producer":  {"user_id": "1", "username": "u1", "display_name": "A"},
+            "observer":  {"user_id": "2", "username": "u2", "display_name": "B"},
+            "pbp_1":     {"user_id": "3", "username": "u3", "display_name": "C"},
+            "colour_1":  {"user_id": "4", "username": "u4", "display_name": "D"},
+        }
+        ids = _get_required_user_ids(ra)
+        assert ids == {"1", "2", "3", "4"}
+
+    def test_excludes_optional_roles(self):
+        from cogs.talent import _get_required_user_ids
+        ra = {
+            "producer": {"user_id": "1", "username": "u1", "display_name": "A"},
+            "pbp_1":    {"user_id": "2", "username": "u2", "display_name": "B"},
+            "host":     {"user_id": "9", "username": "u9", "display_name": "Z"},
+        }
+        ids = _get_required_user_ids(ra)
+        assert "9" not in ids
 
 
 # ===========================================================================
@@ -350,13 +620,7 @@ class TestConfirmButton:
 
 class TestCancelBroadcast:
     def _view(self, db, match):
-        from cogs.talent import AllocationView
-        return AllocationView(
-            match=match, signups=[], db=db,
-            broadcast_channel=AsyncMock(),
-            log_channel=AsyncMock(),
-            get_teamup=lambda: MagicMock(),
-        )
+        return _make_phase1_view(db, match, signups=[])
 
     async def test_cancel_deletes_teamup_event(self, db):
         match_id = _insert_match(db)

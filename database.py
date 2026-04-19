@@ -101,6 +101,19 @@ class Database:
                 user_id TEXT PRIMARY KEY,
                 timezone TEXT NOT NULL DEFAULT 'America/New_York'
             );
+            CREATE TABLE IF NOT EXISTS proposal_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE,
+                week_start TEXT NOT NULL,
+                discord_message_id TEXT,
+                channel_id TEXT,
+                day_ts INTEGER NOT NULL,
+                slot1_match_id INTEGER,
+                slot2_match_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
         """)
         # Migrate existing databases that predate the broadcast_accepted column
         try:
@@ -135,6 +148,14 @@ class Database:
         try:
             self.conn.execute(
                 "ALTER TABLE talent ADD COLUMN response_count INTEGER NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
+        except Exception:
+            pass
+        # Migrate: unavailable_count tracks how many times a talent clicked Unavailable
+        try:
+            self.conn.execute(
+                "ALTER TABLE talent ADD COLUMN unavailable_count INTEGER NOT NULL DEFAULT 0"
             )
             self.conn.commit()
         except Exception:
@@ -596,10 +617,33 @@ class Database:
 
     def get_all_talent(self) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT * FROM talent WHERE broadcast_count > 0 OR response_count > 0 "
-            "ORDER BY broadcast_count DESC, display_name ASC"
+            "SELECT * FROM talent "
+            "WHERE broadcast_count > 0 OR response_count > 0 OR unavailable_count > 0 "
+            "ORDER BY (broadcast_count + response_count + unavailable_count) DESC, display_name ASC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def increment_talent_unavailable(self, user_id: str, username: str,
+                                     display_name: str) -> None:
+        """Increment unavailable_count by 1. Inserts the row if it doesn't exist yet."""
+        self.conn.execute(
+            "INSERT INTO talent (user_id, username, display_name, broadcast_count, "
+            "response_count, unavailable_count) "
+            "VALUES (?, ?, ?, 0, 0, 1) ON CONFLICT(user_id) DO UPDATE SET "
+            "unavailable_count = unavailable_count + 1, "
+            "username = excluded.username, display_name = excluded.display_name",
+            (user_id, username, display_name)
+        )
+        self.conn.commit()
+
+    def remove_all_signups_for_user(self, match_id: int, user_id: str) -> int:
+        """Remove all sign-up rows for a user on a match. Returns number of rows deleted."""
+        cur = self.conn.execute(
+            "DELETE FROM broadcast_signups WHERE match_id = ? AND user_id = ?",
+            (match_id, user_id)
+        )
+        self.conn.commit()
+        return cur.rowcount
 
     # --- Talent allocations ---
 
@@ -708,6 +752,86 @@ class Database:
         )
         self.conn.commit()
 
+    # --- Proposal messages (weekly schedule proposals) ---
+
+    def create_proposal_message(self, date_str: str, day_ts: int,
+                                week_start: str) -> int:
+        """Create a proposal message row for a date. Returns the row id."""
+        now = int(time.time())
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO proposal_messages "
+            "(date, week_start, day_ts, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'open', ?, ?)",
+            (date_str, week_start, day_ts, now, now)
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_proposal_message(self, date_str: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM proposal_messages WHERE date = ?", (date_str,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_proposal_messages_for_week(self, week_start: str) -> list[dict]:
+        """All proposal messages for a given week_start (YYYY-MM-DD of Monday)."""
+        rows = self.conn.execute(
+            "SELECT * FROM proposal_messages WHERE week_start = ? ORDER BY date",
+            (week_start,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_open_proposal_messages(self) -> list[dict]:
+        """All proposal messages still in 'open' status."""
+        rows = self.conn.execute(
+            "SELECT * FROM proposal_messages WHERE status = 'open' ORDER BY date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_blocked_proposal_messages(self) -> list[dict]:
+        """All proposal messages with 'blocked' status."""
+        rows = self.conn.execute(
+            "SELECT * FROM proposal_messages WHERE status = 'blocked' ORDER BY date"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_proposal_slots(self, date_str: str,
+                              slot1_match_id: Optional[int],
+                              slot2_match_id: Optional[int]) -> None:
+        self.conn.execute(
+            "UPDATE proposal_messages SET slot1_match_id = ?, slot2_match_id = ?, "
+            "updated_at = ? WHERE date = ?",
+            (slot1_match_id, slot2_match_id, int(time.time()), date_str)
+        )
+        self.conn.commit()
+
+    def set_proposal_status(self, date_str: str, status: str) -> None:
+        """Set proposal status: 'open', 'blocked', or 'passed'."""
+        self.conn.execute(
+            "UPDATE proposal_messages SET status = ?, updated_at = ? WHERE date = ?",
+            (status, int(time.time()), date_str)
+        )
+        self.conn.commit()
+
+    def set_proposal_discord_message(self, date_str: str,
+                                     message_id: str, channel_id: str) -> None:
+        self.conn.execute(
+            "UPDATE proposal_messages SET discord_message_id = ?, channel_id = ?, "
+            "updated_at = ? WHERE date = ?",
+            (message_id, channel_id, int(time.time()), date_str)
+        )
+        self.conn.commit()
+
+    def get_unscheduled_matches_for_date(self, date_str: str) -> list[dict]:
+        """Matches on date_str with no TeamUp event ID (i.e., not yet on the calendar)."""
+        start_ts, end_ts = self._et_day_range(date_str)
+        rows = self.conn.execute(
+            "SELECT * FROM matches WHERE match_time >= ? AND match_time <= ? "
+            "AND teamup_event_id IS NULL ORDER BY match_time",
+            (start_ts, end_ts)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def reset_season(self) -> None:
         """Clear all season data while preserving config and managers."""
         self.conn.executescript("""
@@ -719,9 +843,10 @@ class Database:
             DELETE FROM broadcast_signups;
             DELETE FROM talent;
             DELETE FROM talent_allocations;
+            DELETE FROM proposal_messages;
             DELETE FROM sqlite_sequence WHERE name IN (
                 'matches', 'pending_changes', 'broadcast_messages',
-                'broadcast_signups', 'talent_allocations'
+                'broadcast_signups', 'talent_allocations', 'proposal_messages'
             );
         """)
         self.conn.commit()
@@ -741,9 +866,10 @@ class Database:
             DELETE FROM talent;
             DELETE FROM talent_allocations;
             DELETE FROM user_settings;
+            DELETE FROM proposal_messages;
             DELETE FROM sqlite_sequence WHERE name IN (
                 'matches', 'pending_changes', 'broadcast_messages',
-                'broadcast_signups', 'talent_allocations'
+                'broadcast_signups', 'talent_allocations', 'proposal_messages'
             );
         """)
         self.conn.commit()

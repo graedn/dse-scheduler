@@ -1,4 +1,3 @@
-import json
 import logging
 import traceback
 import discord
@@ -9,12 +8,6 @@ from typing import Callable
 
 from database import Database
 from parser import has_required_structure, has_partial_structure, parse_post, ParseError
-from scheduler import (
-    accept_combination, schedule_for_date,
-    apply_pending_change, _fmt_date,
-    MATCH_DURATION_H,
-)
-from cogs.talent import send_allocation_request
 
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger(__name__)
@@ -44,21 +37,25 @@ class EventsCog(commands.Cog):
         self._history_scanned = True
         await self._scan_match_history()
 
-    async def _scan_match_history(self):
-        """Scan the match channel history and log future matches not yet in the DB."""
+    async def _scan_match_history(self, limit: int = 500) -> tuple[int, int]:
+        """Scan the match channel history and log future matches not yet in the DB.
+
+        After scanning, dispatches 'match_logged' for each date with newly found
+        matches so proposal messages can be updated by the weekly proposals cog.
+
+        Returns (new_match_count, affected_date_count).
+        """
         match_ch_id = self.db.get_config("match_channel_id")
         channel = self.bot.get_channel(int(match_ch_id)) if match_ch_id else None
         if not channel:
-            return
+            return 0, 0
 
         log_ch = self._get_log_channel()
-        broadcast_ch = self._get_broadcast_channel()
-        signup_ch = self._get_signup_channel()
         now_ts = int(datetime.now(tz=ET).timestamp())
         new_count = 0
         dates_with_new: set[str] = set()
 
-        async for message in channel.history(limit=500, oldest_first=False):
+        async for message in channel.history(limit=limit, oldest_first=False):
             if message.author.bot:
                 continue
             if not has_required_structure(message.content):
@@ -92,16 +89,11 @@ class EventsCog(commands.Cog):
             else:
                 await log_ch.send("🔍 History scan complete: no new future matches found.")
 
-        teamup = self.get_teamup()
+        # Notify weekly proposals cog to update proposal messages for affected dates
         for date_str in sorted(dates_with_new):
-            try:
-                await schedule_for_date(date_str, self.db, teamup, broadcast_ch, log_ch,
-                                        signup_channel=signup_ch)
-            except Exception:
-                if log_ch:
-                    await log_ch.send(
-                        f"⚠️ Scheduling error for **{date_str}** during history scan."
-                    )
+            self.bot.dispatch("match_logged", date_str)
+
+        return new_count, len(dates_with_new)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -121,7 +113,10 @@ class EventsCog(commands.Cog):
             await self._flag_parse_error(message, str(e))
             return
 
-        match_id = self.db.insert_match(
+        if self.db.match_exists(parsed.team_home, parsed.team_away, parsed.match_time):
+            return  # Duplicate — silently ignore
+
+        self.db.insert_match(
             division=parsed.division,
             week=parsed.week,
             team_home=parsed.team_home,
@@ -132,21 +127,19 @@ class EventsCog(commands.Cog):
 
         match_date = datetime.fromtimestamp(parsed.match_time, tz=ET).strftime("%Y-%m-%d")
 
-        try:
-            await schedule_for_date(
-                match_date, self.db, self.get_teamup(),
-                self._get_broadcast_channel(), self._get_log_channel(),
-                signup_channel=self._get_signup_channel(),
-            )
-        except Exception:
-            tb = traceback.format_exc()
-            log.exception("Scheduling failed for match_id=%s on %s", match_id, match_date)
-            log_ch = self._get_log_channel()
-            if log_ch:
+        log_ch = self._get_log_channel()
+        if log_ch:
+            try:
                 await log_ch.send(
-                    f"❌ **Scheduling error** for match_id={match_id} on {match_date}:\n"
-                    f"```{tb[-1500:]}```"
+                    f"📋 Match logged for **{match_date}**: "
+                    f"[{parsed.division}] {parsed.team_home} vs {parsed.team_away} "
+                    f"— <t:{parsed.match_time}:F>"
                 )
+            except Exception:
+                log.exception("Failed to send match log message")
+
+        # Notify weekly proposals cog to update proposal message for this date
+        self.bot.dispatch("match_logged", match_date)
 
     async def _flag_missing_timestamp(self, message: discord.Message):
         """DM the player when their post has the right structure but no Discord timestamp."""
@@ -219,10 +212,6 @@ class EventsCog(commands.Cog):
         if ch_id:
             return self.bot.get_channel(int(ch_id))
         return None
-
-    # ------------------------------------------------------------------
-    # No reaction handlers needed — proposals and confirmations use buttons
-    # ------------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):

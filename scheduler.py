@@ -1,9 +1,6 @@
-from itertools import combinations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
-import asyncio
-import json
 import logging
 
 log = logging.getLogger(__name__)
@@ -26,10 +23,7 @@ def match_end_ts(start_ts: int) -> int:
         .timestamp()
     )
     return min(end, day_end)
-OVERLAP_MAX_H = 1.5       # matches closer than this are considered overlapping
-PAIR_MIN_H = 1.9          # ~2h pair: minimum gap for back-to-back pair bonus
-PAIR_MAX_H = 2.1          # ~2h pair: maximum gap for back-to-back pair bonus
-SLOT_ALIGN_BONUS = 75     # bonus per match that fills a 2h slot adjacent to a scheduled match
+
 
 # --- Talent sign-up constants ---
 
@@ -60,133 +54,13 @@ for _role, _emoji in ROLE_EMOJIS.items():
     EMOJI_TO_ROLE[_emoji.replace(_VS16, "")] = _role
 
 GREEN_CIRCLE = "🟢"                    # Manager override emoji (U+1F7E2)
-ROLE_LIMITS = {"producer": 1, "observer": 1, "pbp": 1, "colour": 1, "host": 1, "analyst": 2}
+ROLE_LIMITS = {"producer": 1, "observer": 1, "pbp": 2, "colour": 2, "host": 1, "analyst": 2}
 REQUIRED_ROLES = {"producer", "pbp", "colour", "observer"}
 SIGNUP_EMOJIS = list(ROLE_EMOJIS.values())
 SIGNUP_DEADLINE_SECONDS_BEFORE = 2 * 3600   # sign-ups close 2h before match
-PRIME_HOUR_ET = 20          # 8pm
-SECONDARY_HOURS_ET = [18, 22]  # 6pm, 10pm
-TIME_TOLERANCE_H = 15 / 60  # 15 minutes
-MAX_MATCHES_PER_DAY = 3
 
 
 # --- Time helpers ---
-
-def get_et_hour(unix_ts: int) -> float:
-    dt = datetime.fromtimestamp(unix_ts, tz=ET)
-    return dt.hour + dt.minute / 60.0
-
-
-def is_weekend(unix_ts: int) -> bool:
-    return datetime.fromtimestamp(unix_ts, tz=ET).weekday() >= 5
-
-
-# --- Pair logic ---
-
-def are_consecutive(ts1: int, ts2: int) -> bool:
-    gap_h = (ts2 - ts1) / 3600.0
-    return PAIR_MIN_H <= gap_h <= PAIR_MAX_H
-
-
-def has_overlap(ts1: int, ts2: int) -> bool:
-    gap_h = (ts2 - ts1) / 3600.0
-    return gap_h < OVERLAP_MAX_H
-
-
-# --- Combination generation ---
-
-def generate_combinations(matches: list[dict]) -> list[list[dict]]:
-    """All valid 2–3 match combinations where every consecutive pair is ~2h apart."""
-    valid = []
-    for size in range(2, min(len(matches) + 1, MAX_MATCHES_PER_DAY + 1)):
-        for combo in combinations(matches, size):
-            sorted_combo = sorted(combo, key=lambda m: m["match_time"])
-            if all(
-                are_consecutive(sorted_combo[i]["match_time"], sorted_combo[i + 1]["match_time"])
-                for i in range(len(sorted_combo) - 1)
-            ):
-                valid.append(list(sorted_combo))
-    return valid
-
-
-# --- Scoring ---
-
-def score_combination(combo: list[dict], weekend: bool, db) -> int:
-    sorted_combo = sorted(combo, key=lambda m: m["match_time"])
-    score = 0
-
-    for match in sorted_combo:
-        hour = get_et_hour(match["match_time"])
-        if weekend:
-            if abs(hour - PRIME_HOUR_ET) <= TIME_TOLERANCE_H:
-                score += 50
-            elif any(abs(hour - h) <= TIME_TOLERANCE_H for h in SECONDARY_HOURS_ET):
-                score += 20
-        else:
-            if abs(hour - PRIME_HOUR_ET) <= TIME_TOLERANCE_H:
-                score += 100
-            elif any(abs(hour - h) <= TIME_TOLERANCE_H for h in SECONDARY_HOURS_ET):
-                score += 30
-
-    pair_bonus = 100 if weekend else 110
-    for i in range(len(sorted_combo) - 1):
-        if are_consecutive(sorted_combo[i]["match_time"], sorted_combo[i + 1]["match_time"]):
-            score += pair_bonus
-
-    for match in sorted_combo:
-        for team_name in [match["team_home"], match["team_away"]]:
-            team = db.get_team(team_name)
-            if team:
-                score -= 10 * team["scheduled_count"]
-
-    return score
-
-
-def combo_match_ids(combo: list[dict]) -> list[int]:
-    return sorted(m["id"] for m in combo)
-
-
-def best_combination(matches: list[dict], db,
-                     scheduled: list[dict] = None) -> Optional[list[dict]]:
-    if len(matches) < 2:
-        return None
-    weekend = is_weekend(matches[0]["match_time"])
-    combos = generate_combinations(matches)
-    if not combos:
-        return None
-
-    # Times already on the calendar — new matches that slot exactly 2h away get a bonus
-    anchor_times = [m["match_time"] for m in scheduled] if scheduled else []
-
-    def _score(combo):
-        base = score_combination(combo, weekend, db)
-        if not anchor_times:
-            return base
-        bonus = 0
-        for match in combo:
-            for anchor in anchor_times:
-                gap_h = abs(match["match_time"] - anchor) / 3600.0
-                if PAIR_MIN_H <= gap_h <= PAIR_MAX_H:
-                    bonus += SLOT_ALIGN_BONUS
-        return base + bonus
-
-    scored = [(c, _score(c)) for c in combos]
-    max_score = max(s for _, s in scored)
-    tied = [c for c, s in scored if s == max_score]
-
-    def team_fairness(combo):
-        total = 0
-        for match in combo:
-            for name in [match["team_home"], match["team_away"]]:
-                team = db.get_team(name)
-                if team:
-                    total += team["scheduled_count"] + team["broadcast_count"]
-        return total
-
-    return min(tied, key=team_fairness)
-
-
-# --- Proposal message formatting ---
 
 def _fmt_match_line(match: dict, fmt: str = "t") -> str:
     ts = match["match_time"]
@@ -203,11 +77,10 @@ def _fmt_date(date_str: str) -> str:
 _SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 _CALENDAR_LINK = "[View Calendar](https://teamup.com/ksb1114dr63p4yb3gr)"
 
-# Per-date lock to prevent concurrent schedule_for_date calls from racing
-_date_locks: dict[str, asyncio.Lock] = {}
 
-
-def build_signup_message(match: dict, signups: list[dict], last_call: bool = False) -> str:
+def build_signup_message(match: dict, signups: list[dict],
+                         last_call: bool = False,
+                         talent_role_mention: str = "") -> str:
     """Format the per-match talent sign-up message with countdown timestamps."""
     ts = match["match_time"]
     call_time = ts - 1800  # 30 min before match start
@@ -252,19 +125,23 @@ def build_signup_message(match: dict, signups: list[dict], last_call: bool = Fal
         "*Click a role button to sign up or withdraw.*",
         "*Managers: use the **Force Schedule** button to trigger immediate talent allocation.*",
         "",
-        _CALENDAR_LINK,
     ]
+    if talent_role_mention:
+        lines.append(talent_role_mention)
+    lines.append(_CALENDAR_LINK)
     return "\n".join(lines)
 
 
 _APPROVED_DISPLAY_ORDER = [
-    ("producer",  "Producer"),
-    ("observer",  "Observer"),
-    ("pbp",       "Play-by-Play"),
-    ("colour",    "Colour Caster"),
-    ("host",      "Host"),
-    ("analyst_1", "Analyst"),
-    ("analyst_2", "Analyst"),
+    ("producer",   "Producer"),
+    ("observer",   "Observer"),
+    ("pbp_1",      "Play-by-Play"),
+    ("pbp_2",      "Play-by-Play"),
+    ("colour_1",   "Colour Caster"),
+    ("colour_2",   "Colour Caster"),
+    ("host",       "Host"),
+    ("analyst_1",  "Analyst"),
+    ("analyst_2",  "Analyst"),
 ]
 
 
@@ -296,21 +173,44 @@ def is_fully_staffed(signups: list[dict]) -> bool:
     """True when sign-ups meet the minimum crew requirements.
 
     Rules:
-    - All four required roles (producer, observer, pbp, colour) must have a signup.
-    - PBP and Colour must be different people.
-    - At least 3 unique users across the required roles (producer/observer may share a person).
+    - All four required roles (producer, observer, pbp, colour) must have at
+      least one signup.
+    - PBP and Colour must be completely disjoint sets of people.
+    - Producer and Observer users cannot be in the PBP or Colour sets.
+    - At least 3 unique users across all required roles.
     """
-    by_role: dict[str, str] = {}  # role -> user_id (only first signup counts per role)
+    producers: set[str] = set()
+    observers: set[str] = set()
+    pbps: set[str] = set()
+    colours: set[str] = set()
+
     for s in signups:
         role = s["role"]
-        if role in REQUIRED_ROLES and role not in by_role:
-            by_role[role] = s["user_id"]
+        uid = s["user_id"]
+        if role == "producer":
+            producers.add(uid)
+        elif role == "observer":
+            observers.add(uid)
+        elif role == "pbp":
+            pbps.add(uid)
+        elif role == "colour":
+            colours.add(uid)
 
-    if not all(role in by_role for role in REQUIRED_ROLES):
+    # All four required roles must be covered
+    if not producers or not observers or not pbps or not colours:
         return False
-    if by_role["pbp"] == by_role["colour"]:
+
+    # PBP and Colour must be disjoint
+    if pbps & colours:
         return False
-    return len(set(by_role.values())) >= 3
+
+    # Producer and Observer cannot be PBP or Colour
+    casters = pbps | colours
+    if (producers & casters) or (observers & casters):
+        return False
+
+    # At least 3 unique users
+    return len(producers | observers | pbps | colours) >= 3
 
 
 def build_talent_description(signups: list[dict]) -> str:
@@ -330,37 +230,10 @@ def build_talent_description(signups: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def build_proposal_message(date_str: str, current_combo: list[dict],
-                            proposed_combo: list[dict],
-                            current_score: int, proposed_score: int, db) -> str:
-    current_lines = "\n".join(
-        _fmt_match_line(m, fmt="F") for m in sorted(current_combo, key=lambda m: m["match_time"])
-    )
-    proposed_lines = "\n".join(
-        _fmt_match_line(m, fmt="F") for m in sorted(proposed_combo, key=lambda m: m["match_time"])
-    )
-    team_info = []
-    for match in proposed_combo:
-        for name in [match["team_home"], match["team_away"]]:
-            team = db.get_team(name)
-            bc = team["broadcast_count"] if team else 0
-            team_info.append(f"{name} ({bc} prior broadcasts)")
-
-    return (
-        f"{_SEPARATOR}\n"
-        f"📋 **Broadcast Schedule Proposal — {_fmt_date(date_str)}**\n\n"
-        f"**Current schedule:**\n{current_lines}\n\n"
-        f"**Proposed schedule:**\n{proposed_lines}\n\n"
-        f"**Reason:** Proposed combination scores {proposed_score} vs current {current_score}.\n"
-        f"Teams: {', '.join(team_info)}\n\n"
-        f"Auto-approves in 12 hours if no action is taken and there are no active sign-ups for the current schedule."
-    )
-
-
-# --- Shared accept / propose helpers (called by both EventsCog and daily sweep) ---
+# --- Shared accept helper (called by ProposalDayView Update Schedule button) ---
 
 async def accept_combination(combo: list[dict], date_str: str, db, teamup,
-                              signup_channel) -> None:
+                              signup_channel, talent_role_mention: str = "") -> None:
     """Add a match combination to the Proposed Calendar and post per-match sign-up messages.
 
     Phase 1: create all TeamUp events (no DB writes yet — so a partial failure is safe).
@@ -399,7 +272,9 @@ async def accept_combination(combo: list[dict], date_str: str, db, teamup,
                 signups = db.get_signups_for_match(match["id"])
                 view = SignUpView(match["id"])
                 msg = await signup_channel.send(
-                    build_signup_message(fresh_match, signups), view=view
+                    build_signup_message(fresh_match, signups,
+                                        talent_role_mention=talent_role_mention),
+                    view=view
                 )
                 posted.append(msg)
                 db.insert_broadcast_message(match["id"], str(msg.id), str(signup_channel.id))
@@ -410,240 +285,6 @@ async def accept_combination(combo: list[dict], date_str: str, db, teamup,
                 except Exception:
                     pass
             raise
-
-
-async def propose_change(date_str: str, current: list[dict], proposed: list[dict],
-                          current_score: int, proposed_score: int,
-                          db, broadcast_channel, log_channel=None) -> None:
-    """Post a draft proposal to the log channel (falling back to broadcast) and store a pending change."""
-    from cogs.proposal import ProposalView
-    target = log_channel or broadcast_channel
-    if not target:
-        return
-    old_event_ids = [m["teamup_event_id"] for m in current if m.get("teamup_event_id")]
-    new_match_ids = [m["id"] for m in proposed]
-    # Insert pending change first to get the change_id for the ProposalView
-    change_id = db.insert_pending_change(
-        description="",
-        old_event_ids=old_event_ids,
-        new_match_ids=new_match_ids,
-        discord_message_id=None,
-    )
-    msg_text = build_proposal_message(
-        date_str, current, proposed, current_score, proposed_score, db
-    )
-    msg_text += (
-        "\n\n**Approve** — accept the new schedule | "
-        "**Reject** — keep current | "
-        "**Delete Events** — remove from calendar | "
-        "**Block Day** — remove all + NO STREAM"
-    )
-    view = ProposalView(change_id)
-    msg = await target.send(msg_text, view=view)
-    db.update_pending_change_message(change_id, str(msg.id), msg_text)
-
-
-async def apply_pending_change(change: dict, db, teamup,
-                               broadcast_channel,
-                               signup_channel=None) -> Optional[str]:
-    """Delete old TeamUp events and accept the proposed combination.
-
-    Used for both manual ✅ approvals and auto-approval after 12 hours.
-    Marks the change as approved and returns the date string, or None.
-    """
-    old_ids = json.loads(change["old_event_ids"])
-    new_match_ids = json.loads(change["new_match_ids"])
-
-    for event_id in old_ids:
-        try:
-            teamup.delete_event(event_id)
-        except Exception:
-            pass
-        for match in db.get_matches_by_teamup_event_id(event_id):
-            db.update_match_teamup_id(match["id"], None)
-            db.decrement_scheduled_count(match["team_home"])
-            db.decrement_scheduled_count(match["team_away"])
-
-    new_matches = [db.get_match(mid) for mid in new_match_ids]
-    new_matches = [m for m in new_matches if m]
-    date_str = None
-    if new_matches:
-        date_str = datetime.fromtimestamp(
-            new_matches[0]["match_time"], tz=ET
-        ).strftime("%Y-%m-%d")
-        effective_signup_ch = signup_channel or broadcast_channel
-        await accept_combination(new_matches, date_str, db, teamup, effective_signup_ch)
-
-    db.resolve_pending_change(change["id"], approved=True)
-    return date_str
-
-
-async def process_expired_changes(db, teamup, broadcast_channel,
-                                   signup_channel=None) -> None:
-    """Auto-approve pending changes whose 12-hour window has passed.
-
-    Skips auto-approval if any match in the current (displaced) schedule has
-    active sign-ups — avoids disrupting talent who have already signed up.
-    """
-    for change in db.get_expired_pending_changes():
-        # Check whether any displaced match has sign-ups
-        old_event_ids: list[str] = json.loads(change.get("old_event_ids") or "[]")
-        has_signups = False
-        for event_id in old_event_ids:
-            for match in db.get_matches_by_teamup_event_id(event_id):
-                if db.get_signups_for_match(match["id"]):
-                    has_signups = True
-                    break
-            if has_signups:
-                break
-
-        if has_signups:
-            log.info(
-                "Skipping auto-approval for change %s — active sign-ups exist on displaced matches.",
-                change["id"],
-            )
-            continue
-
-        date_str = await apply_pending_change(
-            change, db, teamup, broadcast_channel, signup_channel=signup_channel
-        )
-        if broadcast_channel and date_str:
-            await broadcast_channel.send(
-                f"✅ Schedule proposal auto-approved for {_fmt_date(date_str)}."
-            )
-
-
-async def schedule_for_date(date_str: str, db, teamup, broadcast_channel,
-                            log_channel=None, signup_channel=None) -> None:
-    """Canonical scheduling logic for one date.
-
-    Direct-add rules (no approval needed):
-      - Nothing scheduled for the day → add the match immediately.
-      - Match is within ~2h of an existing PROPOSED (not accepted) match → add it alongside.
-
-    Proposal rule (checkmark/X approval needed):
-      - Leftover matches that couldn't fill an open slot exist, AND a better
-        combination is possible by rearranging proposed (not accepted) matches.
-
-    Accepted matches (talent confirmed) are never displaced automatically.
-
-    signup_channel: where per-match sign-up messages are posted (falls back to
-    broadcast_channel when not set).
-    """
-    if date_str not in _date_locks:
-        _date_locks[date_str] = asyncio.Lock()
-    async with _date_locks[date_str]:
-        await _schedule_for_date_locked(
-            date_str, db, teamup, broadcast_channel, log_channel,
-            signup_channel or broadcast_channel,
-        )
-
-
-async def _schedule_for_date_locked(
-    date_str: str, db, teamup, broadcast_channel,
-    log_channel, effective_signup_ch,
-) -> None:
-    """Inner scheduling logic — must be called with the per-date lock held."""
-    if db.get_blocked_day(date_str):
-        return
-
-    all_matches = db.get_matches_for_date(date_str)
-    proposed = [m for m in all_matches if m.get("teamup_event_id") and not m.get("broadcast_accepted")]
-    unscheduled = [m for m in all_matches if not m.get("teamup_event_id")]
-
-    if not unscheduled:
-        return
-
-    # --- Step 1: direct-add qualifying matches ---
-    not_added: list[dict] = []
-    for match in unscheduled:
-        if not proposed:
-            qualifies = True  # Nothing on the calendar yet — take the first match
-        else:
-            # A match qualifies only if it slots ~2h from an existing proposed match
-            # AND does not overlap (gap < 1.5h) with any existing proposed match.
-            # The overlap guard prevents same-time duplicates when multiple matches
-            # race to qualify via the ~2h window of a third anchor match.
-            qualifies = (
-                any(
-                    PAIR_MIN_H <= abs(match["match_time"] - p["match_time"]) / 3600.0 <= PAIR_MAX_H
-                    for p in proposed
-                )
-                and not any(
-                    abs(match["match_time"] - p["match_time"]) / 3600.0 < OVERLAP_MAX_H
-                    for p in proposed
-                )
-            )
-
-        if qualifies:
-            if teamup:
-                await accept_combination([match], date_str, db, teamup, effective_signup_ch)
-                fresh = db.get_match(match["id"])
-                proposed.append(fresh or match)  # use DB-fresh dict so teamup_event_id is populated
-            else:
-                if log_channel:
-                    await log_channel.send(
-                        f"⚠️ TeamUp not configured — "
-                        f"{match['team_home']} vs {match['team_away']} "
-                        f"for {_fmt_date(date_str)} stored but not added to calendar."
-                    )
-        else:
-            not_added.append(match)
-
-    # --- Step 2: check if leftover matches form a better combo → proposal ---
-    if not_added and proposed:
-        all_non_accepted = proposed + not_added
-        best = best_combination(all_non_accepted, db, proposed)
-        if best is not None and combo_match_ids(best) != combo_match_ids(proposed):
-            current_score = score_combination(proposed, is_weekend(proposed[0]["match_time"]), db)
-            best_score = score_combination(best, is_weekend(best[0]["match_time"]), db)
-            if best_score > current_score:
-                if broadcast_channel or log_channel:
-                    await propose_change(
-                        date_str, proposed, best, current_score, best_score,
-                        db, broadcast_channel, log_channel=log_channel,
-                    )
-                elif log_channel:
-                    await log_channel.send(
-                        f"⚠️ Broadcast channel not configured — "
-                        f"dropping proposal for {_fmt_date(date_str)}."
-                    )
-
-    # --- Step 3: log matches that couldn't be scheduled ---
-    if log_channel and not_added and not (not_added and proposed):
-        n = len(all_matches)
-        await log_channel.send(
-            f"ℹ️ Match stored for **{_fmt_date(date_str)}** "
-            f"({n} match{'es' if n != 1 else ''} logged — "
-            f"need a ~2h partner to schedule)."
-        )
-
-
-async def run_morning_check(db, teamup, broadcast_channel,
-                            signup_channel=None) -> None:
-    """9am check: ensure today's unscheduled matches are on the Proposed Calendar."""
-    today_str = datetime.now(tz=ET).strftime("%Y-%m-%d")
-    if not teamup or not db.get_matches_for_date(today_str):
-        return
-    await schedule_for_date(today_str, db, teamup, broadcast_channel,
-                            signup_channel=signup_channel)
-
-
-async def run_daily_sweep(db, teamup, broadcast_channel,
-                          signup_channel=None) -> None:
-    """3am sweep: evaluate all upcoming days this week and process expired changes."""
-    today = datetime.now(tz=ET).date()
-    monday = today - timedelta(days=today.weekday())
-
-    for i in range(7):
-        day = monday + timedelta(days=i)
-        if day < today:
-            continue
-        await schedule_for_date(day.isoformat(), db, teamup, broadcast_channel,
-                                signup_channel=signup_channel)
-
-    await process_expired_changes(db, teamup, broadcast_channel,
-                                  signup_channel=signup_channel)
 
 
 def build_matches_announcement(db) -> str:
