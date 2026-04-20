@@ -3,7 +3,7 @@ import logging
 
 from database import Database
 from scheduler import (
-    ROLE_EMOJIS, ROLE_LABELS, ROLE_LIMITS, REQUIRED_ROLES, _SEPARATOR,
+    ROLE_EMOJIS, ROLE_LABELS, REQUIRED_ROLES, _SEPARATOR,
 )
 
 log = logging.getLogger(__name__)

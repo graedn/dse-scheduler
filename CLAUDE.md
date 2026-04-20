@@ -51,7 +51,7 @@ cogs/
 - **Broadcast Cancelled notification** is sent to `schedule_updates_channel_id` (falls back to broadcast channel). The sign-up message is always edited to show CANCELLED regardless.
 - **Sign-up deadline is 2 hours before match time** (`SIGNUP_DEADLINE_SECONDS_BEFORE = 2 * 3600`).
 - **Call time is 30 minutes before match** — if crew is still incomplete at call time, the match is cancelled.
-- **`is_fully_staffed`** requires all 4 required roles filled + PBP ≠ Colour + Producer/Observer not in PBP/Colour sets + ≥ 3 unique users across required roles. Producer and Observer may share a person. This governs sign-up sufficiency (not allocation). Up to 2 people can sign up for PBP or Colour to give managers options.
+- **`is_fully_staffed`** requires all 4 required roles filled + PBP ≠ Colour + Producer/Observer not in PBP/Colour sets + ≥ 3 unique users across required roles. Producer and Observer may share a person. This governs sign-up sufficiency (not allocation). Any number of people can sign up for any role — all are shown in the allocation dropdowns.
 - **Allocation role keys**: `producer`, `observer`, `pbp_1`, `colour_1` (required); `host`, `analyst_1` (optional). Managers select exactly one PBP and one Colour in the allocation UI.
 - **Force Schedule** on the sign-up view bypasses `is_fully_staffed` and triggers allocation immediately.
 - **`get_teamup()`** creates a new `TeamUpClient` instance each call (reads config from DB).
