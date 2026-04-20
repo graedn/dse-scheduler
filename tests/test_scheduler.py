@@ -122,22 +122,22 @@ def test_is_fully_staffed_observer_cannot_be_colour():
     assert is_fully_staffed(sigs) is False
 
 
-def test_is_fully_staffed_two_pbp_ok():
-    """Two different people can sign up as PBP (max_values=2)."""
+def test_is_fully_staffed_multiple_pbp_ok():
+    """Multiple people can sign up as PBP — is_fully_staffed passes as long as one exists."""
     sigs = [
         _sig("producer", "u1"), _sig("observer", "u1"),
-        _sig("pbp",      "u2"), _sig("pbp",      "u3"),  # two PBPs
+        _sig("pbp",      "u2"), _sig("pbp",      "u3"), _sig("pbp", "u5"),
         _sig("colour",   "u4"),
     ]
     assert is_fully_staffed(sigs) is True
 
 
-def test_is_fully_staffed_two_colour_ok():
-    """Two different people can sign up as Colour."""
+def test_is_fully_staffed_multiple_colour_ok():
+    """Multiple people can sign up as Colour."""
     sigs = [
         _sig("producer", "u1"), _sig("observer", "u1"),
         _sig("pbp",      "u2"),
-        _sig("colour",   "u3"), _sig("colour",   "u4"),  # two Colours
+        _sig("colour",   "u3"), _sig("colour",   "u4"), _sig("colour", "u5"),
     ]
     assert is_fully_staffed(sigs) is True
 
@@ -263,19 +263,19 @@ def test_approved_message_shows_allocated_talent():
     assert "Prod" in msg
 
 
-def test_approved_message_shows_two_pbp():
+def test_approved_message_shows_allocated_pbp():
+    """Approved message shows the single allocated PBP (pbp_1 key only)."""
     match = {"id": 1, "division": "Premier", "team_home": "A", "team_away": "B",
              "match_time": TS_8PM}
     role_assignments = {
-        "producer": {"user_id": "u1", "display_name": "Prod", "username": "p"},
-        "observer": {"user_id": "u1", "display_name": "Prod", "username": "p"},
-        "pbp_1":    {"user_id": "u2", "display_name": "PBP1", "username": "pb1"},
-        "pbp_2":    {"user_id": "u3", "display_name": "PBP2", "username": "pb2"},
-        "colour_1": {"user_id": "u4", "display_name": "Col1", "username": "c1"},
+        "producer": {"user_id": "u1", "display_name": "Prod",  "username": "p"},
+        "observer": {"user_id": "u1", "display_name": "Prod",  "username": "p"},
+        "pbp_1":    {"user_id": "u2", "display_name": "PBP1",  "username": "pb1"},
+        "colour_1": {"user_id": "u4", "display_name": "Col1",  "username": "c1"},
     }
     msg = build_approved_signup_message(match, role_assignments)
     assert "PBP1" in msg
-    assert "PBP2" in msg
+    assert "Col1" in msg
 
 
 def test_approved_message_omits_unassigned_roles():

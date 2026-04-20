@@ -54,7 +54,6 @@ for _role, _emoji in ROLE_EMOJIS.items():
     EMOJI_TO_ROLE[_emoji.replace(_VS16, "")] = _role
 
 GREEN_CIRCLE = "🟢"                    # Manager override emoji (U+1F7E2)
-ROLE_LIMITS = {"producer": 1, "observer": 1, "pbp": 2, "colour": 2, "host": 1, "analyst": 2}
 REQUIRED_ROLES = {"producer", "pbp", "colour", "observer"}
 SIGNUP_EMOJIS = list(ROLE_EMOJIS.values())
 SIGNUP_DEADLINE_SECONDS_BEFORE = 2 * 3600   # sign-ups close 2h before match
@@ -136,12 +135,9 @@ _APPROVED_DISPLAY_ORDER = [
     ("producer",   "Producer"),
     ("observer",   "Observer"),
     ("pbp_1",      "Play-by-Play"),
-    ("pbp_2",      "Play-by-Play"),
     ("colour_1",   "Colour Caster"),
-    ("colour_2",   "Colour Caster"),
     ("host",       "Host"),
     ("analyst_1",  "Analyst"),
-    ("analyst_2",  "Analyst"),
 ]
 
 
@@ -211,23 +207,6 @@ def is_fully_staffed(signups: list[dict]) -> bool:
 
     # At least 3 unique users
     return len(producers | observers | pbps | colours) >= 3
-
-
-def build_talent_description(signups: list[dict]) -> str:
-    """Plain-text talent roster for the TeamUp event description field (sign-up based)."""
-    by_role: dict[str, list[dict]] = {}
-    for s in sorted(signups, key=lambda x: x["signed_up_at"]):
-        by_role.setdefault(s["role"], []).append(s)
-
-    parts = []
-    for role in ["producer", "observer", "pbp", "colour", "host", "analyst"]:
-        people = by_role.get(role, [])[:ROLE_LIMITS[role]]
-        if not people:
-            continue
-        label = ROLE_LABELS[role]
-        names = ", ".join(f"{p['display_name']} ({p['username']})" for p in people)
-        parts.append(f"{label}: {names}")
-    return "\n".join(parts)
 
 
 # --- Shared accept helper (called by ProposalDayView Update Schedule button) ---

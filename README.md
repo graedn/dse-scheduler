@@ -141,7 +141,7 @@ When a match is confirmed via Update Schedule, the bot posts a sign-up message i
 | Analyst | Optional | |
 | Unavailable | — | Marks you unavailable; removes any existing role sign-ups |
 
-Up to 2 people can sign up for PBP or Colour — managers choose one of each during allocation.
+Any number of people can sign up for any role — managers choose one person per role during allocation.
 
 ### Criteria for auto-trigger
 Sign-ups are considered complete when:
