@@ -8,6 +8,7 @@ from typing import Callable
 
 from database import Database
 from parser import has_required_structure, has_partial_structure, parse_post, ParseError
+from scheduler import _SEPARATOR
 
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger(__name__)
@@ -259,8 +260,7 @@ class EventsCog(commands.Cog):
             # State 3: cancel sign-up message and notify talent
             signup_ch_id = (db.get_config("signup_channel_id")
                             or db.get_config("broadcast_channel_id"))
-            signup_ch = (self.bot.get_channel(signup_ch_id)
-                         if signup_ch_id else None)
+            signup_ch = self.bot.get_channel(int(signup_ch_id)) if signup_ch_id else None
             if signup_ch:
                 try:
                     signup_msg = await signup_ch.fetch_message(
@@ -268,7 +268,7 @@ class EventsCog(commands.Cog):
                     )
                     await signup_msg.edit(
                         content=(
-                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"{_SEPARATOR}\n"
                             f"❌ **CANCELLED — Match Rescheduled**\n"
                             f"📋 {match_label}\n"
                             f"~~<t:{old_ts}:F>~~ → <t:{new_ts}:F>\n\n"
@@ -285,8 +285,7 @@ class EventsCog(commands.Cog):
             all_uids = list({s["user_id"] for s in signups})
             mentions = " ".join(f"<@{uid}>" for uid in all_uids)
             updates_ch_id = db.get_config("schedule_updates_channel_id")
-            updates_ch = (self.bot.get_channel(updates_ch_id)
-                          if updates_ch_id else None) or signup_ch
+            updates_ch = (self.bot.get_channel(int(updates_ch_id)) if updates_ch_id else None) or signup_ch
             if updates_ch:
                 try:
                     await updates_ch.send(

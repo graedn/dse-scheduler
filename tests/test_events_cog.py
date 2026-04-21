@@ -539,18 +539,18 @@ async def test_handle_reschedule_state3_cancels_signup_message(db):
     bot.dispatch = MagicMock()
 
     def _get_channel(ch_id):
-        if str(ch_id) == "123":
+        if ch_id == 123:
             return MagicMock()
-        if str(ch_id) == "456":
+        if ch_id == 456:
             return log_ch
-        if str(ch_id) == "ch_signup_999":
+        if ch_id == 999:
             return signup_ch
         return None
 
     bot.get_channel.side_effect = _get_channel
     db.set_config("match_channel_id", "123")
     db.set_config("log_channel_id", "456")
-    db.set_config("signup_channel_id", "ch_signup_999")
+    db.set_config("signup_channel_id", "999")
     cog = EventsCog(bot, db, get_teamup=lambda: None)
 
     msg = _make_message(_valid_post(WEEK_WED_TS))
@@ -576,20 +576,20 @@ async def test_handle_reschedule_state3_notifies_talent(db):
     bot.dispatch = MagicMock()
 
     def _get_channel(ch_id):
-        if str(ch_id) == "123": return MagicMock()
-        if str(ch_id) == "456": return log_ch
-        if str(ch_id) == "ch_signup_999":
+        if ch_id == 123: return MagicMock()
+        if ch_id == 456: return log_ch
+        if ch_id == 999:
             sc = AsyncMock()
             sc.fetch_message = AsyncMock(return_value=AsyncMock())
             return sc
-        if str(ch_id) == "ch_updates_777": return updates_ch
+        if ch_id == 777: return updates_ch
         return None
 
     bot.get_channel.side_effect = _get_channel
     db.set_config("match_channel_id", "123")
     db.set_config("log_channel_id", "456")
-    db.set_config("signup_channel_id", "ch_signup_999")
-    db.set_config("schedule_updates_channel_id", "ch_updates_777")
+    db.set_config("signup_channel_id", "999")
+    db.set_config("schedule_updates_channel_id", "777")
     cog = EventsCog(bot, db, get_teamup=lambda: None)
 
     msg = _make_message(_valid_post(WEEK_WED_TS))
