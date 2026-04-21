@@ -2,7 +2,7 @@ import logging
 import traceback
 import discord
 from discord.ext import commands
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Callable
 
@@ -11,6 +11,16 @@ from parser import has_required_structure, has_partial_structure, parse_post, Pa
 
 ET = ZoneInfo("America/New_York")
 log = logging.getLogger(__name__)
+
+
+def _week_bounds(ts: int) -> tuple[int, int]:
+    """Return (week_start_ts, week_end_ts) for the Mon–Sun ET week containing ts."""
+    dt = datetime.fromtimestamp(ts, tz=ET)
+    monday = (dt - timedelta(days=dt.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    sunday = (monday + timedelta(days=6)).replace(hour=23, minute=59, second=59)
+    return int(monday.timestamp()), int(sunday.timestamp())
 
 
 _REQUIRED_CONFIG = [
@@ -113,8 +123,15 @@ class EventsCog(commands.Cog):
             await self._flag_parse_error(message, str(e))
             return
 
-        if self.db.match_exists(parsed.team_home, parsed.team_away, parsed.match_time):
-            return  # Duplicate — silently ignore
+        week_start, week_end = _week_bounds(parsed.match_time)
+        old_match = self.db.get_match_by_teams_in_week(
+            parsed.team_home, parsed.team_away, week_start, week_end
+        )
+        if old_match:
+            if old_match["match_time"] == parsed.match_time:
+                return  # True duplicate — silently ignore
+            await self._handle_reschedule(old_match, parsed)
+            return
 
         self.db.insert_match(
             division=parsed.division,
@@ -138,8 +155,28 @@ class EventsCog(commands.Cog):
             except Exception:
                 log.exception("Failed to send match log message")
 
-        # Notify weekly proposals cog to update proposal message for this date
         self.bot.dispatch("match_logged", match_date)
+
+    async def _handle_reschedule(self, old_match: dict, parsed) -> None:
+        """Dispatch to correct handling based on old match state. Full logic added in Task 4."""
+        old_ts = old_match["match_time"]
+        new_ts = parsed.match_time
+        old_date = datetime.fromtimestamp(old_ts, tz=ET).strftime("%Y-%m-%d")
+        new_date = datetime.fromtimestamp(new_ts, tz=ET).strftime("%Y-%m-%d")
+
+        self.db.clear_match_from_proposal_slots(old_match["id"])
+        self.db.delete_match_cascade(old_match["id"])
+        self.db.insert_match(
+            division=parsed.division,
+            week=parsed.week,
+            team_home=parsed.team_home,
+            team_away=parsed.team_away,
+            match_time=new_ts,
+            posted_at=int(datetime.now(tz=ET).timestamp()),
+        )
+        self.bot.dispatch("match_logged", new_date)
+        if old_date != new_date:
+            self.bot.dispatch("match_logged", old_date)
 
     async def _flag_missing_timestamp(self, message: discord.Message):
         """DM the player when their post has the right structure but no Discord timestamp."""
