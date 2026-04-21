@@ -364,3 +364,32 @@ async def test_on_message_same_time_is_duplicate_not_reschedule(db):
 
     assert db.get_match(old_id) is not None  # original untouched
     assert len(db.get_matches_for_date("2099-06-08")) == 1  # no duplicate
+
+
+async def test_on_message_different_week_is_new_match(db):
+    """When a new post appears for the same matchup (Alpha vs Beta) but in a different week,
+    it is treated as a new match (not a reschedule). The old match should remain and a new
+    one should be inserted."""
+    cog = _make_cog(db, _make_match_channel(), AsyncMock())
+
+    # Pre-insert old match in week of 2099-06-08 (Monday)
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    # New message arrives for the same teams but in the next week (2099-06-15, Monday)
+    msg = _make_message(_valid_post_for_time(NEXT_MON_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+
+    await cog.on_message(msg)
+
+    # Old match should still exist (not rescheduled/deleted)
+    assert db.get_match(old_id) is not None
+    old_match = db.get_match(old_id)
+    assert old_match["match_time"] == WEEK_MON_TS
+
+    # New match should be inserted in the next week
+    new_matches = db.get_matches_for_date("2099-06-15")
+    assert len(new_matches) == 1
+    assert new_matches[0]["match_time"] == NEXT_MON_TS
+    assert new_matches[0]["team_home"] == "Alpha"
+    assert new_matches[0]["team_away"] == "Beta"
