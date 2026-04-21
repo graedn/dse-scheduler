@@ -280,6 +280,45 @@ class Database:
         ).fetchone()
         return row is not None
 
+    def get_match_by_teams_in_week(self, team_home: str, team_away: str,
+                                    week_start_ts: int, week_end_ts: int) -> Optional[dict]:
+        """Return the first match for team_home vs team_away in the given Mon–Sun ET window."""
+        row = self.conn.execute(
+            "SELECT * FROM matches WHERE team_home = ? AND team_away = ? "
+            "AND match_time >= ? AND match_time <= ? LIMIT 1",
+            (team_home, team_away, week_start_ts, week_end_ts)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_match_cascade(self, match_id: int) -> None:
+        """Delete a match and all dependent rows (signups, broadcast message, allocation, thread)."""
+        self.conn.execute("DELETE FROM broadcast_signups WHERE match_id = ?", (match_id,))
+        self.conn.execute("DELETE FROM broadcast_messages WHERE match_id = ?", (match_id,))
+        self.conn.execute("DELETE FROM talent_allocations WHERE match_id = ?", (match_id,))
+        self.conn.execute("DELETE FROM thread_messages WHERE match_id = ?", (match_id,))
+        self.conn.execute("DELETE FROM matches WHERE id = ?", (match_id,))
+        self.conn.commit()
+
+    def clear_match_from_proposal_slots(self, match_id: int) -> None:
+        """Null out any proposal slot references to this match."""
+        self.conn.execute(
+            "UPDATE proposal_messages SET slot1_match_id = NULL WHERE slot1_match_id = ?",
+            (match_id,)
+        )
+        self.conn.execute(
+            "UPDATE proposal_messages SET slot2_match_id = NULL WHERE slot2_match_id = ?",
+            (match_id,)
+        )
+        self.conn.commit()
+
+    def update_match_time(self, match_id: int, new_match_time: int) -> None:
+        """Update a match's timestamp in-place (used when a confirmed broadcast is rescheduled)."""
+        self.conn.execute(
+            "UPDATE matches SET match_time = ? WHERE id = ?",
+            (new_match_time, match_id)
+        )
+        self.conn.commit()
+
     def get_matches_by_teamup_event_id(self, event_id: str) -> list[dict]:
         """Get all matches associated with a given TeamUp event ID."""
         rows = self.conn.execute(

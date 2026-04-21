@@ -1,7 +1,21 @@
 import pytest
 import time
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from database import Database
+
+ET = ZoneInfo("America/New_York")
+
+# Monday 2099-06-08 19:00 ET and Wednesday 2099-06-10 19:00 ET — same week
+WEEK_MON_TS = int(datetime(2099, 6, 8, 19, 0, tzinfo=ET).timestamp())
+WEEK_WED_TS = int(datetime(2099, 6, 10, 19, 0, tzinfo=ET).timestamp())
+# Monday 2099-06-15 19:00 ET — next week
+NEXT_WEEK_TS = int(datetime(2099, 6, 15, 19, 0, tzinfo=ET).timestamp())
+
+# Week bounds: 2099-06-08 00:00 ET (Monday) to 2099-06-14 23:59:59 ET (Sunday)
+WEEK_START = int(datetime(2099, 6, 8, 0, 0, 0, tzinfo=ET).timestamp())
+WEEK_END   = int(datetime(2099, 6, 14, 23, 59, 59, tzinfo=ET).timestamp())
 
 
 @pytest.fixture
@@ -689,3 +703,104 @@ def test_reset_all_clears_thread_messages(db):
     db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 0, 0)
     db.reset_all()
     assert db.get_thread_message(mid) is None
+
+
+# --- get_match_by_teams_in_week ---
+
+def test_get_match_by_teams_in_week_finds_same_week(db):
+    db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    result = db.get_match_by_teams_in_week("Alpha", "Beta", WEEK_START, WEEK_END)
+    assert result is not None
+    assert result["match_time"] == WEEK_MON_TS
+
+
+def test_get_match_by_teams_in_week_returns_none_for_different_week(db):
+    db.insert_match("Premier", "1", "Alpha", "Beta", NEXT_WEEK_TS, NEXT_WEEK_TS - 100)
+    result = db.get_match_by_teams_in_week("Alpha", "Beta", WEEK_START, WEEK_END)
+    assert result is None
+
+
+def test_get_match_by_teams_in_week_returns_none_when_no_match(db):
+    result = db.get_match_by_teams_in_week("Alpha", "Beta", WEEK_START, WEEK_END)
+    assert result is None
+
+
+def test_get_match_by_teams_in_week_different_teams_not_found(db):
+    db.insert_match("Premier", "1", "Gamma", "Delta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    result = db.get_match_by_teams_in_week("Alpha", "Beta", WEEK_START, WEEK_END)
+    assert result is None
+
+
+# --- delete_match_cascade ---
+
+def test_delete_match_cascade_removes_match(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.delete_match_cascade(mid)
+    assert db.get_match(mid) is None
+
+
+def test_delete_match_cascade_removes_signups(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.upsert_signup(mid, str(mid), "pbp", "u1", "user1", "User One")
+    db.delete_match_cascade(mid)
+    assert db.get_signups_for_match(mid) == []
+
+
+def test_delete_match_cascade_removes_broadcast_message(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.insert_broadcast_message(mid, "msg123", "ch456")
+    db.delete_match_cascade(mid)
+    assert db.get_broadcast_message(mid) is None
+
+
+def test_delete_match_cascade_removes_allocation(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.create_allocation(mid)
+    db.delete_match_cascade(mid)
+    assert db.get_allocation(mid) is None
+
+
+# --- clear_match_from_proposal_slots ---
+
+def test_clear_match_from_proposal_slots_clears_slot1(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.create_proposal_message("2099-06-08", WEEK_START, "2099-06-08")
+    db.update_proposal_slots("2099-06-08", mid, None)
+    db.clear_match_from_proposal_slots(mid)
+    prop = db.get_proposal_message("2099-06-08")
+    assert prop["slot1_match_id"] is None
+
+
+def test_clear_match_from_proposal_slots_clears_slot2(db):
+    mid1 = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    mid2 = db.insert_match("Division 1", "1", "Gamma", "Delta", WEEK_WED_TS, WEEK_WED_TS - 100)
+    db.create_proposal_message("2099-06-08", WEEK_START, "2099-06-08")
+    db.update_proposal_slots("2099-06-08", mid1, mid2)
+    db.clear_match_from_proposal_slots(mid2)
+    prop = db.get_proposal_message("2099-06-08")
+    assert prop["slot1_match_id"] == mid1
+    assert prop["slot2_match_id"] is None
+
+
+def test_clear_match_from_proposal_slots_noop_when_not_assigned(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.create_proposal_message("2099-06-08", WEEK_START, "2099-06-08")
+    db.clear_match_from_proposal_slots(mid)  # should not raise
+    prop = db.get_proposal_message("2099-06-08")
+    assert prop["slot1_match_id"] is None
+
+
+# --- update_match_time ---
+
+def test_update_match_time_changes_timestamp(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.update_match_time(mid, WEEK_WED_TS)
+    assert db.get_match(mid)["match_time"] == WEEK_WED_TS
+
+
+def test_update_match_time_other_fields_unchanged(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.update_match_time(mid, WEEK_WED_TS)
+    match = db.get_match(mid)
+    assert match["team_home"] == "Alpha"
+    assert match["division"] == "Premier"
