@@ -73,7 +73,7 @@ No automatic action. The log channel receives a manager ping with three buttons:
 **🔄 Initiate Sign Up**
 > Start fresh sign-ups for the rescheduled time. The existing sign-up is marked as rescheduled and a new one is posted. Assigned talent are notified.
 
-**Action:** Edit old sign-up message to RESCHEDULED (no buttons) → reset allocation → post new sign-up message for new match time → notify talent in `schedule_updates_channel`.
+**Action:** Update `match_time` in DB → edit old sign-up message to RESCHEDULED (no buttons) → reset allocation → post new sign-up message for new match time → dispatch `match_logged` to refresh proposal message dropdown → notify talent in `schedule_updates_channel`.
 
 ---
 
