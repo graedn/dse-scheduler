@@ -384,3 +384,100 @@ async def test_on_message_different_week_is_new_match(db):
     assert new_matches[0]["match_time"] == NEXT_MON_TS
     assert new_matches[0]["team_home"] == "Alpha"
     assert new_matches[0]["team_away"] == "Beta"
+
+
+# --- on_raw_message_edit ---
+
+import discord as discord_lib
+
+
+def _make_raw_edit_payload(message_id: int, channel_id: int):
+    payload = MagicMock(spec=discord_lib.RawMessageUpdateEvent)
+    payload.message_id = message_id
+    payload.channel_id = channel_id
+    return payload
+
+
+async def test_on_raw_message_edit_reschedule_detected(db):
+    """An edited match post with a new time triggers reschedule handling."""
+    log_ch = AsyncMock()
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    edited_msg = _make_message(_valid_post(WEEK_WED_TS))
+    edited_msg.author.bot = False
+
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=edited_msg)
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+
+    def _get_channel(ch_id):
+        if str(ch_id) == "123":
+            return ch
+        if str(ch_id) == "456":
+            return log_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    await cog.on_raw_message_edit(payload)
+
+    assert db.get_match(old_id) is None
+    assert len(db.get_matches_for_date("2099-06-10")) == 1
+
+
+async def test_on_raw_message_edit_ignores_non_match_channel(db):
+    """Edits in a different channel are ignored."""
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.set_config("match_channel_id", "123")
+    cog = _make_cog(db, _make_match_channel())
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=999)  # wrong channel
+    await cog.on_raw_message_edit(payload)
+
+    assert db.get_match(old_id) is not None  # unchanged
+
+
+async def test_on_raw_message_edit_ignores_bot_messages(db):
+    """Bot-authored edits are ignored."""
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    bot_msg = _make_message(_valid_post(WEEK_WED_TS), is_bot=True)
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=bot_msg)
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+    bot.get_channel.return_value = ch
+    db.set_config("match_channel_id", "123")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    await cog.on_raw_message_edit(payload)
+
+    assert db.get_match(old_id) is not None  # unchanged
+
+
+async def test_on_raw_message_edit_same_time_is_noop(db):
+    """An edit that doesn't change the time is silently ignored."""
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    edited_msg = _make_message(_valid_post(WEEK_MON_TS))  # same time
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=edited_msg)
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+    bot.get_channel.return_value = ch
+    db.set_config("match_channel_id", "123")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    await cog.on_raw_message_edit(payload)
+
+    assert db.get_match(old_id) is not None  # unchanged

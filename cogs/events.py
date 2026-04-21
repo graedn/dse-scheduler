@@ -157,6 +157,59 @@ class EventsCog(commands.Cog):
 
         self.bot.dispatch("match_logged", match_date)
 
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        match_channel_id = self.db.get_config("match_channel_id")
+        if not match_channel_id or str(payload.channel_id) != match_channel_id:
+            return
+
+        channel = self.bot.get_channel(payload.channel_id)
+        if not channel:
+            return
+
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.NotFound:
+            return
+
+        if message.author.bot:
+            return
+        if not has_required_structure(message.content):
+            return
+
+        try:
+            parsed = parse_post(message.content, self.db)
+        except ParseError:
+            return
+
+        now_ts = int(datetime.now(tz=ET).timestamp())
+        if parsed.match_time <= now_ts:
+            return
+
+        week_start, week_end = _week_bounds(parsed.match_time)
+        old_match = self.db.get_match_by_teams_in_week(
+            parsed.team_home, parsed.team_away, week_start, week_end
+        )
+
+        if not old_match:
+            if not self.db.match_exists(parsed.team_home, parsed.team_away, parsed.match_time):
+                self.db.insert_match(
+                    division=parsed.division,
+                    week=parsed.week,
+                    team_home=parsed.team_home,
+                    team_away=parsed.team_away,
+                    match_time=parsed.match_time,
+                    posted_at=int(datetime.now(tz=ET).timestamp()),
+                )
+                match_date = datetime.fromtimestamp(parsed.match_time, tz=ET).strftime("%Y-%m-%d")
+                self.bot.dispatch("match_logged", match_date)
+            return
+
+        if old_match["match_time"] == parsed.match_time:
+            return  # no-op — same time
+
+        await self._handle_reschedule(old_match, parsed)
+
     async def _handle_reschedule(self, old_match: dict, parsed) -> None:
         """Dispatch to correct handling based on old match state. Full logic added in Task 4."""
         status = old_match.get("status", "pending")
