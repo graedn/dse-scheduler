@@ -171,6 +171,15 @@ class EventsCog(commands.Cog):
             message = await channel.fetch_message(payload.message_id)
         except discord.NotFound:
             return
+        except discord.Forbidden:
+            log.warning(
+                "Missing Read Message History in channel %s — cannot process edit",
+                payload.channel_id,
+            )
+            return
+        except discord.HTTPException as e:
+            log.warning("fetch_message failed for message %s: %s", payload.message_id, e)
+            return
 
         if message.author.bot:
             return
@@ -199,7 +208,7 @@ class EventsCog(commands.Cog):
                     team_home=parsed.team_home,
                     team_away=parsed.team_away,
                     match_time=parsed.match_time,
-                    posted_at=int(datetime.now(tz=ET).timestamp()),
+                    posted_at=int(message.created_at.timestamp()),
                 )
                 match_date = datetime.fromtimestamp(parsed.match_time, tz=ET).strftime("%Y-%m-%d")
                 self.bot.dispatch("match_logged", match_date)
