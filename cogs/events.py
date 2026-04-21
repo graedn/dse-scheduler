@@ -159,6 +159,14 @@ class EventsCog(commands.Cog):
 
     async def _handle_reschedule(self, old_match: dict, parsed) -> None:
         """Dispatch to correct handling based on old match state. Full logic added in Task 4."""
+        status = old_match.get("status", "pending")
+        if status not in ("pending", "criteria_met"):
+            log.warning(
+                "Reschedule attempted on match %s with status %r — skipping (full state handling in Task 4)",
+                old_match["id"], status,
+            )
+            return
+
         old_ts = old_match["match_time"]
         new_ts = parsed.match_time
         old_date = datetime.fromtimestamp(old_ts, tz=ET).strftime("%Y-%m-%d")

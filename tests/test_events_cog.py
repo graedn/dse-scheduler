@@ -40,15 +40,6 @@ def _valid_post(ts: int = FUTURE_TS) -> str:
     )
 
 
-def _valid_post_for_time(ts: int) -> str:
-    return (
-        f"Division: Premier\n"
-        f"Week: 1\n"
-        f"Alpha vs Beta\n"
-        f"Time: <t:{ts}:F>"
-    )
-
-
 async def _async_gen(*messages):
     """Async generator that yields messages — simulates channel.history()."""
     for m in messages:
@@ -310,7 +301,7 @@ async def test_on_message_reschedule_detected_deletes_old_match(db):
     old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
 
     # New message arrives with Wednesday timestamp (same week)
-    msg = _make_message(_valid_post_for_time(WEEK_WED_TS))
+    msg = _make_message(_valid_post(WEEK_WED_TS))
     msg.channel = MagicMock()
     msg.channel.id = 123
 
@@ -328,7 +319,7 @@ async def test_on_message_reschedule_dispatches_match_logged_for_new_date(db):
     cog = _make_cog(db, _make_match_channel(), AsyncMock())
     db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
 
-    msg = _make_message(_valid_post_for_time(WEEK_WED_TS))
+    msg = _make_message(_valid_post(WEEK_WED_TS))
     msg.channel = MagicMock()
     msg.channel.id = 123
     await cog.on_message(msg)
@@ -342,7 +333,7 @@ async def test_on_message_reschedule_dispatches_old_date_when_different(db):
     cog = _make_cog(db, _make_match_channel(), AsyncMock())
     db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
 
-    msg = _make_message(_valid_post_for_time(WEEK_WED_TS))
+    msg = _make_message(_valid_post(WEEK_WED_TS))
     msg.channel = MagicMock()
     msg.channel.id = 123
     await cog.on_message(msg)
@@ -357,7 +348,7 @@ async def test_on_message_same_time_is_duplicate_not_reschedule(db):
     cog = _make_cog(db, _make_match_channel(), AsyncMock())
     old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
 
-    msg = _make_message(_valid_post_for_time(WEEK_MON_TS))
+    msg = _make_message(_valid_post(WEEK_MON_TS))
     msg.channel = MagicMock()
     msg.channel.id = 123
     await cog.on_message(msg)
@@ -376,7 +367,7 @@ async def test_on_message_different_week_is_new_match(db):
     old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
 
     # New message arrives for the same teams but in the next week (2099-06-15, Monday)
-    msg = _make_message(_valid_post_for_time(NEXT_MON_TS))
+    msg = _make_message(_valid_post(NEXT_MON_TS))
     msg.channel = MagicMock()
     msg.channel.id = 123
 
