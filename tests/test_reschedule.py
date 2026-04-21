@@ -232,3 +232,55 @@ async def test_cancel_broadcast_denied_for_non_manager(db):
     await btn.callback(interaction)
 
     interaction.response.send_message.assert_called_once()
+
+
+async def test_update_broadcast_button_calls_teamup_update(db):
+    """Update Broadcast updates the TeamUp event to subcalendar 'accepted'."""
+    from cogs.reschedule import RescheduleView
+
+    mid = _make_match(db, ts=WEEK_MON_TS)
+    db.create_allocation(mid)
+    db.update_match_teamup_id(mid, "evt_update_abc")
+
+    teamup = MagicMock()
+    interaction = _make_interaction(db)
+    interaction.client.get_teamup.return_value = teamup
+
+    view = RescheduleView(mid, WEEK_MON_TS, WEEK_WED_TS)
+    btn = next(b for b in view.children if "Update" in b.label)
+    await btn.callback(interaction)
+
+    teamup.update_event.assert_called_once()
+    call_kwargs = teamup.update_event.call_args[1] if teamup.update_event.call_args[1] else {}
+    call_args = teamup.update_event.call_args[0]
+    # subcalendar="accepted" may be positional or keyword — check both
+    assert "accepted" in str(teamup.update_event.call_args)
+
+
+async def test_initiate_signup_button_calls_teamup_update_proposed(db):
+    """Initiate Sign Up updates the TeamUp event to subcalendar 'proposed'."""
+    from cogs.reschedule import RescheduleView
+
+    mid = _make_match(db, ts=WEEK_MON_TS)
+    db.create_allocation(mid)
+    db.update_match_teamup_id(mid, "evt_initiate_xyz")
+    db.insert_broadcast_message(mid, "msg_old_111", "999")
+
+    teamup = MagicMock()
+    signup_ch = AsyncMock()
+    signup_ch.fetch_message = AsyncMock(return_value=AsyncMock())
+    new_msg = AsyncMock()
+    new_msg.id = 99999
+    signup_ch.send = AsyncMock(return_value=new_msg)
+
+    interaction = _make_interaction(db)
+    interaction.client.get_teamup.return_value = teamup
+    interaction.client.get_channel.return_value = signup_ch
+    db.set_config("signup_channel_id", "999")
+
+    view = RescheduleView(mid, WEEK_MON_TS, WEEK_WED_TS)
+    btn = next(b for b in view.children if "Sign Up" in b.label)
+    await btn.callback(interaction)
+
+    teamup.update_event.assert_called_once()
+    assert "proposed" in str(teamup.update_event.call_args)

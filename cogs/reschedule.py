@@ -174,6 +174,7 @@ class _UpdateBroadcastButton(discord.ui.Button):
         )
 
         # Disable view and edit interaction message
+        self.view.stop()
         _disable_view(self.view)
         await interaction.response.edit_message(
             content=interaction.message.content + "\n\n✅ **Broadcast time updated.**",
@@ -314,6 +315,7 @@ class _InitiateSignUpButton(discord.ui.Button):
         )
 
         # Disable view and edit interaction message
+        self.view.stop()
         _disable_view(self.view)
         await interaction.response.edit_message(
             content=interaction.message.content + "\n\n🔄 **New sign-up posted.**",
@@ -365,8 +367,9 @@ class _CancelBroadcastButton(discord.ui.Button):
         signups = db.get_signups_for_match(match_id)
         all_user_ids = list({s["user_id"] for s in signups})
 
-        # Reset allocation
+        # Reset allocation and mark match cancelled
         db.reset_allocation(match_id)
+        db.set_allocation_status(match_id, "cancelled")
 
         # Edit sign-up message to CANCELLED state
         bcast = db.get_broadcast_message(match_id)
@@ -421,6 +424,7 @@ class _CancelBroadcastButton(discord.ui.Button):
         )
 
         # Disable view and edit interaction message
+        self.view.stop()
         _disable_view(self.view)
         await interaction.response.edit_message(
             content=interaction.message.content + "\n\n❌ **Broadcast cancelled.**",
