@@ -220,23 +220,92 @@ class EventsCog(commands.Cog):
         await self._handle_reschedule(old_match, parsed)
 
     async def _handle_reschedule(self, old_match: dict, parsed) -> None:
-        """Dispatch to correct handling based on old match state. Full logic added in Task 4."""
-        status = old_match.get("status", "pending")
-        if status not in ("pending", "criteria_met"):
-            log.warning(
-                "Reschedule attempted on match %s with status %r — skipping (full state handling in Task 4)",
-                old_match["id"], status,
-            )
-            return
+        """State-based reschedule handler. Does NOT insert the new match for State 4."""
+        from cogs.reschedule import RescheduleView
 
         old_ts = old_match["match_time"]
         new_ts = parsed.match_time
+        old_mid = old_match["id"]
         old_date = datetime.fromtimestamp(old_ts, tz=ET).strftime("%Y-%m-%d")
         new_date = datetime.fromtimestamp(new_ts, tz=ET).strftime("%Y-%m-%d")
+        db = self.db
+        log_ch = self._get_log_channel()
+        manager_role_id = db.get_config("manager_role_id")
+        manager_mention = f"<@&{manager_role_id}> " if manager_role_id else ""
+        match_label = (
+            f"[{old_match['division']}] "
+            f"{old_match['team_home']} vs {old_match['team_away']}"
+        )
 
-        self.db.clear_match_from_proposal_slots(old_match["id"])
-        self.db.delete_match_cascade(old_match["id"])
-        self.db.insert_match(
+        # State 4: confirmed broadcast — post action buttons, leave DB alone
+        if old_match.get("broadcast_accepted"):
+            if log_ch:
+                view = RescheduleView(old_mid, old_ts, new_ts)
+                await log_ch.send(
+                    f"⚠️ **Match Time Changed — Action Required** {manager_mention}\n"
+                    f"📋 {match_label}\n"
+                    f"~~<t:{old_ts}:F>~~ → <t:{new_ts}:F>\n\n"
+                    f"This match has a confirmed broadcast. Choose how to handle the time change:",
+                    view=view,
+                )
+            return
+
+        # States 1–3: pre-confirmed — always delete old, insert new
+        signups = db.get_signups_for_match(old_mid)
+        bcast = db.get_broadcast_message(old_mid)
+        status_note = ""
+
+        if signups and bcast:
+            # State 3: cancel sign-up message and notify talent
+            signup_ch_id = (db.get_config("signup_channel_id")
+                            or db.get_config("broadcast_channel_id"))
+            signup_ch = (self.bot.get_channel(signup_ch_id)
+                         if signup_ch_id else None)
+            if signup_ch:
+                try:
+                    signup_msg = await signup_ch.fetch_message(
+                        bcast["discord_message_id"]
+                    )
+                    await signup_msg.edit(
+                        content=(
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"❌ **CANCELLED — Match Rescheduled**\n"
+                            f"📋 {match_label}\n"
+                            f"~~<t:{old_ts}:F>~~ → <t:{new_ts}:F>\n\n"
+                            f"This match has been rescheduled. "
+                            f"A new sign-up will be posted once confirmed."
+                        ),
+                        view=discord.ui.View(),
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to edit sign-up message on reschedule for match %s", old_mid
+                    )
+
+            all_uids = list({s["user_id"] for s in signups})
+            mentions = " ".join(f"<@{uid}>" for uid in all_uids)
+            updates_ch_id = db.get_config("schedule_updates_channel_id")
+            updates_ch = (self.bot.get_channel(updates_ch_id)
+                          if updates_ch_id else None) or signup_ch
+            if updates_ch:
+                try:
+                    await updates_ch.send(
+                        f"📢 **Schedule Update** — {match_label} has been rescheduled.\n"
+                        f"~~<t:{old_ts}:F>~~ → <t:{new_ts}:F>\n\n"
+                        f"{mentions} — your sign-up has been removed. "
+                        f"A new sign-up will be posted if the slot is rescheduled."
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to send talent reschedule notification for match %s", old_mid
+                    )
+            status_note = "Sign-up cancelled. Signed-up talent have been notified."
+        else:
+            status_note = "Updated in Logged Matches."
+
+        db.clear_match_from_proposal_slots(old_mid)
+        db.delete_match_cascade(old_mid)
+        db.insert_match(
             division=parsed.division,
             week=parsed.week,
             team_home=parsed.team_home,
@@ -244,6 +313,20 @@ class EventsCog(commands.Cog):
             match_time=new_ts,
             posted_at=int(datetime.now(tz=ET).timestamp()),
         )
+
+        if log_ch:
+            try:
+                await log_ch.send(
+                    f"⚠️ **Match Rescheduled** {manager_mention}\n"
+                    f"📋 {match_label}\n"
+                    f"~~<t:{old_ts}:F>~~ → <t:{new_ts}:F>\n"
+                    f"{status_note}"
+                )
+            except Exception:
+                log.exception(
+                    "Failed to send reschedule log notification for match %s", old_mid
+                )
+
         self.bot.dispatch("match_logged", new_date)
         if old_date != new_date:
             self.bot.dispatch("match_logged", old_date)

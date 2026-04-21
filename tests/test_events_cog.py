@@ -481,3 +481,122 @@ async def test_on_raw_message_edit_same_time_is_noop(db):
     await cog.on_raw_message_edit(payload)
 
     assert db.get_match(old_id) is not None  # unchanged
+
+
+# --- _handle_reschedule: state-based logic ---
+
+async def test_handle_reschedule_clears_proposal_slot(db):
+    """Rescheduling a match that is in a proposal slot clears the slot."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    ET2 = ZoneInfo("America/New_York")
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.create_proposal_message("2099-06-08",
+                               int(datetime(2099, 6, 8, 0, 0, tzinfo=ET2).timestamp()),
+                               "2099-06-02")
+    db.update_proposal_slots("2099-06-08", mid, None)
+
+    cog = _make_cog(db, _make_match_channel(), AsyncMock())
+
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    prop = db.get_proposal_message("2099-06-08")
+    assert prop["slot1_match_id"] is None
+
+
+async def test_handle_reschedule_sends_log_notification(db):
+    """Log channel receives a reschedule notification."""
+    log_ch = AsyncMock()
+    db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    cog = _make_cog(db, _make_match_channel(), log_ch)
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    log_ch.send.assert_called_once()
+    call_text = log_ch.send.call_args[0][0]
+    assert "escheduled" in call_text  # "Rescheduled" or "rescheduled"
+    assert "Alpha" in call_text
+
+
+async def test_handle_reschedule_state3_cancels_signup_message(db):
+    """When the old match has signups, the sign-up message is edited to CANCELLED."""
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.upsert_signup(mid, "msg1", "pbp", "u1", "user1", "User One")
+    db.insert_broadcast_message(mid, "msg_discord_111", "ch_signup_999")
+
+    signup_msg = AsyncMock()
+    signup_ch = AsyncMock()
+    signup_ch.fetch_message = AsyncMock(return_value=signup_msg)
+    log_ch = AsyncMock()
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+
+    def _get_channel(ch_id):
+        if str(ch_id) == "123":
+            return MagicMock()
+        if str(ch_id) == "456":
+            return log_ch
+        if str(ch_id) == "ch_signup_999":
+            return signup_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    db.set_config("signup_channel_id", "ch_signup_999")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    signup_msg.edit.assert_called_once()
+    edit_content = signup_msg.edit.call_args[1]["content"]
+    assert "CANCELLED" in edit_content or "RESCHEDULED" in edit_content
+
+
+async def test_handle_reschedule_state3_notifies_talent(db):
+    """Talent who signed up receive a schedule-update notification."""
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.upsert_signup(mid, "msg1", "pbp", "u1", "user1", "User One")
+    db.insert_broadcast_message(mid, "msg_discord_111", "ch_signup_999")
+
+    updates_ch = AsyncMock()
+    log_ch = AsyncMock()
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+
+    def _get_channel(ch_id):
+        if str(ch_id) == "123": return MagicMock()
+        if str(ch_id) == "456": return log_ch
+        if str(ch_id) == "ch_signup_999":
+            sc = AsyncMock()
+            sc.fetch_message = AsyncMock(return_value=AsyncMock())
+            return sc
+        if str(ch_id) == "ch_updates_777": return updates_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    db.set_config("signup_channel_id", "ch_signup_999")
+    db.set_config("schedule_updates_channel_id", "ch_updates_777")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    updates_ch.send.assert_called_once()
+    call_text = updates_ch.send.call_args[0][0]
+    assert "<@u1>" in call_text
