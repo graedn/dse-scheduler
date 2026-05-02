@@ -313,3 +313,117 @@ async def test_unblock_day_deletes_teamup_event(db):
     await button.callback(_unblock_interaction(db, teamup=teamup))
 
     teamup.delete_event.assert_called_once_with("evt_block_123")
+
+
+# ---------------------------------------------------------------------------
+# _send_schedule_update_ping
+# ---------------------------------------------------------------------------
+
+async def test_send_schedule_update_ping_returns_message(db):
+    """The helper returns the sent Message so callers can use its jump_url."""
+    from cogs.weekly_proposals import _send_schedule_update_ping
+    db.set_config("schedule_updates_channel_id", "999")
+
+    sent_msg = MagicMock()
+    sent_msg.jump_url = "https://discord.com/channels/1/2/3"
+    updates_ch = AsyncMock()
+    updates_ch.send = AsyncMock(return_value=sent_msg)
+    client = MagicMock()
+    client.get_channel = MagicMock(return_value=updates_ch)
+
+    result = await _send_schedule_update_ping(
+        DATE_STR, ["1", "2"], client, db, "test reason",
+    )
+
+    assert result is sent_msg
+    updates_ch.send.assert_awaited_once()
+    payload = updates_ch.send.call_args[0][0]
+    assert "<@1>" in payload
+    assert "<@2>" in payload
+    assert "test reason" in payload
+
+
+async def test_send_schedule_update_ping_returns_none_when_unconfigured(db):
+    """No schedule_updates_channel_id configured → returns None silently."""
+    from cogs.weekly_proposals import _send_schedule_update_ping
+    client = MagicMock()
+    result = await _send_schedule_update_ping(
+        DATE_STR, ["1"], client, db, "reason",
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _link_schedule_update_to_signups
+# ---------------------------------------------------------------------------
+
+async def test_link_schedule_update_appends_jump_url_to_signup(db):
+    """For each new match's sign-up, a 'View schedule update' link with the
+    update message's jump_url is appended."""
+    from cogs.weekly_proposals import _link_schedule_update_to_signups
+    mid = db.insert_match(
+        division="Premier", week="W1", team_home="A", team_away="B",
+        match_time=MATCH_TS, posted_at=MATCH_TS - 3600,
+    )
+    db.insert_broadcast_message(mid, "100", "999")
+
+    update_msg = MagicMock()
+    update_msg.jump_url = "https://discord.com/channels/1/2/3"
+
+    fetched_msg = AsyncMock()
+    fetched_msg.content = "ORIGINAL CONTENT"
+    fetched_msg.edit = AsyncMock()
+    signup_ch = AsyncMock()
+    signup_ch.fetch_message = AsyncMock(return_value=fetched_msg)
+
+    await _link_schedule_update_to_signups([mid], update_msg, signup_ch, db)
+
+    fetched_msg.edit.assert_awaited_once()
+    new_content = fetched_msg.edit.call_args[1]["content"]
+    assert new_content.startswith("ORIGINAL CONTENT")
+    assert "View schedule update" in new_content
+    assert update_msg.jump_url in new_content
+
+
+async def test_link_schedule_update_skips_match_without_broadcast_message(db):
+    """If a match has no broadcast_message row, the link step is silently skipped."""
+    from cogs.weekly_proposals import _link_schedule_update_to_signups
+    mid = db.insert_match(
+        division="Premier", week="W1", team_home="A", team_away="B",
+        match_time=MATCH_TS, posted_at=MATCH_TS - 3600,
+    )
+    # No insert_broadcast_message call
+
+    update_msg = MagicMock(jump_url="https://example/jump")
+    signup_ch = AsyncMock()
+
+    await _link_schedule_update_to_signups([mid], update_msg, signup_ch, db)
+
+    signup_ch.fetch_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Affected-signups filter: 'unavailable' role is excluded from ping recipients
+# ---------------------------------------------------------------------------
+
+async def test_unavailable_signups_excluded_from_schedule_update_ping(db):
+    """Build the same affected_signups list that _UpdateScheduleButton builds,
+    and verify users who clicked Unavailable are not in the ping recipients."""
+    mid = db.insert_match(
+        division="Premier", week="W1", team_home="A", team_away="B",
+        match_time=MATCH_TS, posted_at=MATCH_TS - 3600,
+    )
+    db.upsert_signup(mid, "msg_1", "producer",   "100", "u100", "Alice")
+    db.upsert_signup(mid, "msg_1", "observer",   "200", "u200", "Bob")
+    db.upsert_signup(mid, "msg_1", "unavailable", "300", "u300", "Carol")
+
+    affected: list[str] = []
+    for s in db.get_signups_for_match(mid):
+        if s["role"] == "unavailable":
+            continue
+        if s["user_id"] not in affected:
+            affected.append(s["user_id"])
+
+    assert "100" in affected
+    assert "200" in affected
+    assert "300" not in affected

@@ -7,6 +7,7 @@ matches to broadcast slots and confirm with the Update Schedule button.
 import discord
 import logging
 from datetime import datetime, timedelta
+from typing import Optional
 from zoneinfo import ZoneInfo
 from discord.ext import commands
 
@@ -345,6 +346,8 @@ class _UpdateScheduleButton(discord.ui.Button):
                 if mid:
                     old_slot_ids.append(mid)
                     for s in db.get_signups_for_match(mid):
+                        if s["role"] == "unavailable":
+                            continue
                         if s["user_id"] not in affected_signups:
                             affected_signups.append(s["user_id"])
 
@@ -374,10 +377,18 @@ class _UpdateScheduleButton(discord.ui.Button):
 
         db.update_proposal_slots(self.date_str, slot1_id, slot2_id)
 
+        update_msg = None
         if affected_signups and to_remove:
-            await _send_schedule_update_ping(
+            update_msg = await _send_schedule_update_ping(
                 self.date_str, affected_signups, interaction.client, db,
                 "The broadcast schedule for this day has been changed.",
+            )
+
+        # When a sign-up was replaced (both removed AND added), append a link
+        # to the schedule update message on each new sign-up post.
+        if update_msg and to_add and signup_ch:
+            await _link_schedule_update_to_signups(
+                to_add, update_msg, signup_ch, db
             )
 
         all_matches = db.get_matches_for_date(self.date_str)
@@ -426,6 +437,8 @@ class _ClearSelectionsButton(discord.ui.Button):
                 if mid:
                     old_slot_ids.append(mid)
                     for s in db.get_signups_for_match(mid):
+                        if s["role"] == "unavailable":
+                            continue
                         if s["user_id"] not in affected_signups:
                             affected_signups.append(s["user_id"])
 
@@ -501,6 +514,8 @@ class _BlockDayButton(discord.ui.Button):
                 mid = proposal.get(slot_key)
                 if mid:
                     for s in db.get_signups_for_match(mid):
+                        if s["role"] == "unavailable":
+                            continue
                         if s["user_id"] not in affected_signups:
                             affected_signups.append(s["user_id"])
 
@@ -609,21 +624,42 @@ async def _unschedule_match(match_id: int, db, teamup, signup_ch) -> None:
 async def _send_schedule_update_ping(
     date_str: str, user_ids: list[str], client, db,
     reason: str, prefix: str = "📋 **Schedule Update**"
-) -> None:
-    """Send a mention ping to the schedule-updates channel."""
+) -> Optional[discord.Message]:
+    """Send a mention ping to the schedule-updates channel.
+
+    Returns the sent message (so callers can link to it), or None if the
+    channel isn't configured/reachable or the send failed."""
     updates_ch_id = db.get_config("schedule_updates_channel_id")
     if not updates_ch_id:
-        return
+        return None
     updates_ch = client.get_channel(int(updates_ch_id))
     if not updates_ch:
-        return
+        return None
     mentions = " ".join(f"<@{uid}>" for uid in user_ids)
     try:
-        await updates_ch.send(
+        return await updates_ch.send(
             f"{prefix} — {_fmt_date(date_str)}\n{reason}\n{mentions}"
         )
     except Exception as e:
         log.warning("Failed to send schedule-updates ping for %s: %s", date_str, e)
+        return None
+
+
+async def _link_schedule_update_to_signups(
+    new_match_ids: list[int], update_msg: discord.Message,
+    signup_ch, db,
+) -> None:
+    """Append a 'View schedule update' link to each new sign-up message."""
+    link_line = f"\n\n🔗 [View schedule update]({update_msg.jump_url})"
+    for mid in new_match_ids:
+        bcast = db.get_broadcast_message(mid)
+        if not bcast:
+            continue
+        try:
+            msg = await signup_ch.fetch_message(int(bcast["discord_message_id"]))
+            await msg.edit(content=msg.content + link_line)
+        except Exception as e:
+            log.warning("Failed to link schedule update on sign-up %s: %s", mid, e)
 
 
 class _UnblockDayButton(discord.ui.Button):

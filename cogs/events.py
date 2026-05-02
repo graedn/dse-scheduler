@@ -282,11 +282,12 @@ class EventsCog(commands.Cog):
                         "Failed to edit sign-up message on reschedule for match %s", old_mid
                     )
 
-            all_uids = list({s["user_id"] for s in signups})
+            all_uids = list({s["user_id"] for s in signups
+                             if s["role"] != "unavailable"})
             mentions = " ".join(f"<@{uid}>" for uid in all_uids)
             updates_ch_id = db.get_config("schedule_updates_channel_id")
             updates_ch = (self.bot.get_channel(int(updates_ch_id)) if updates_ch_id else None) or signup_ch
-            if updates_ch:
+            if updates_ch and all_uids:
                 try:
                     await updates_ch.send(
                         f"📢 **Schedule Update** — {match_label} has been rescheduled.\n"
@@ -298,7 +299,10 @@ class EventsCog(commands.Cog):
                     log.exception(
                         "Failed to send talent reschedule notification for match %s", old_mid
                     )
-            status_note = "Sign-up cancelled. Signed-up talent have been notified."
+            status_note = (
+                "Sign-up cancelled. Signed-up talent have been notified."
+                if all_uids else "Sign-up cancelled."
+            )
         else:
             status_note = "Updated in Logged Matches."
 

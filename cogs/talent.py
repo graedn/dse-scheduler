@@ -114,6 +114,10 @@ class _ContinueButton(discord.ui.Button):
             return
         is_admin = interaction.user.guild_permissions.administrator
         is_mgr = self.view.db.is_manager(str(interaction.user.id))
+        if not is_mgr:
+            role_id = self.view.db.get_config("manager_role_id")
+            if role_id:
+                is_mgr = any(str(r.id) == role_id for r in interaction.user.roles)
         if not is_admin and not is_mgr:
             await interaction.response.send_message(
                 "Only managers and administrators can confirm allocations.", ephemeral=True
@@ -206,6 +210,10 @@ class _ConfirmButton(discord.ui.Button):
             return
         is_admin = interaction.user.guild_permissions.administrator
         is_mgr = self.view.db.is_manager(str(interaction.user.id))
+        if not is_mgr:
+            role_id = self.view.db.get_config("manager_role_id")
+            if role_id:
+                is_mgr = any(str(r.id) == role_id for r in interaction.user.roles)
         if not is_admin and not is_mgr:
             await interaction.response.send_message(
                 "Only managers and administrators can confirm allocations.", ephemeral=True
@@ -223,7 +231,8 @@ class _ConfirmButton(discord.ui.Button):
             )
             return
 
-        all_sigs = view.db.get_signups_for_match(view.match["id"])
+        all_sigs = [s for s in view.db.get_signups_for_match(view.match["id"])
+                    if s["role"] != "unavailable"]
         signups_by_id = {s["user_id"]: s for s in all_sigs}
         for uid, s in view.signups_by_id.items():
             if uid not in signups_by_id:
@@ -319,7 +328,8 @@ async def _cancel_broadcast(interaction: discord.Interaction, view) -> None:
     view.db.reset_allocation(match["id"])
 
     signups = view.db.get_signups_for_match(match["id"])
-    all_user_ids = list({s["user_id"] for s in signups})
+    all_user_ids = list({s["user_id"] for s in signups
+                         if s["role"] != "unavailable"})
     mentions = " ".join(f"<@{uid}>" for uid in all_user_ids)
     ts = match["match_time"]
     cancel_text = (
@@ -387,6 +397,10 @@ class _CancelButton(discord.ui.Button):
             return
         is_admin = interaction.user.guild_permissions.administrator
         is_mgr = self.view.db.is_manager(str(interaction.user.id))
+        if not is_mgr:
+            role_id = self.view.db.get_config("manager_role_id")
+            if role_id:
+                is_mgr = any(str(r.id) == role_id for r in interaction.user.roles)
         if not is_admin and not is_mgr:
             await interaction.response.send_message(
                 "Only managers and administrators can cancel broadcasts.", ephemeral=True
@@ -465,7 +479,8 @@ async def send_allocation_request(db: Database, match: dict,
     db.create_allocation(match["id"])
     db.set_allocation_status(match["id"], "sent")
 
-    signups = db.get_signups_for_match(match["id"])
+    signups = [s for s in db.get_signups_for_match(match["id"])
+               if s["role"] != "unavailable"]
 
     ts = match["match_time"]
     lines = [

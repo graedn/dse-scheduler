@@ -236,9 +236,9 @@ class RejectButton(discord.ui.Button):
             return
 
         db.set_confirmation(alloc["match_id"], user_id, False)
-        db.reset_allocation(alloc["match_id"])
 
-        match = db.get_match(alloc["match_id"])
+        match_id = alloc["match_id"]
+        match = db.get_match(match_id)
         role_assignments = json.loads(alloc.get("role_assignments") or "{}")
         decliner = next(
             (a for a in role_assignments.values()
@@ -247,8 +247,33 @@ class RejectButton(discord.ui.Button):
         )
         name = decliner["display_name"] if decliner else f"<@{user_id}>"
 
+        # Build the rejected-state message BEFORE resetting allocation so the
+        # decliner shows [Rejected] in the final rendered text.
+        fresh_conf = db.get_confirmations(match_id)
+        rejected_content = build_confirmation_message(match, role_assignments, fresh_conf)
+
+        # Mark the decliner as unavailable on the sign-up so they're excluded
+        # from the re-opened allocation dropdowns.
+        if decliner:
+            bcast = db.get_broadcast_message(match_id)
+            signup_message_id = str(bcast["discord_message_id"]) if bcast else ""
+            db.remove_all_signups_for_user(match_id, user_id)
+            db.upsert_signup(
+                match_id=match_id,
+                message_id=signup_message_id,
+                role="unavailable",
+                user_id=user_id,
+                username=decliner["username"],
+                display_name=decliner["display_name"],
+            )
+            db.increment_talent_unavailable(
+                user_id, decliner["username"], decliner["display_name"]
+            )
+
+        db.reset_allocation(match_id)
+
         await interaction.response.edit_message(
-            content=interaction.message.content
+            content=rejected_content
                     + f"\n\n❌ **{name}** rejected — re-opening allocation.",
             view=discord.ui.View(),
         )

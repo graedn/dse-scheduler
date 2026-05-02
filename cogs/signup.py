@@ -25,7 +25,12 @@ def _manager_check(interaction: discord.Interaction, db) -> bool:
         return False
     if interaction.user.guild_permissions.administrator:
         return True
-    return db.is_manager(str(interaction.user.id))
+    if db.is_manager(str(interaction.user.id)):
+        return True
+    role_id = db.get_config("manager_role_id")
+    if role_id:
+        return any(str(r.id) == role_id for r in interaction.user.roles)
+    return False
 
 
 def _get_effective_signup_ch(db, bot):
@@ -171,10 +176,6 @@ class UnavailableButton(discord.ui.Button):
         signups = db.get_signups_for_match(self.match_id)
         user_signups = [s for s in signups if s["user_id"] == user_id]
         already_unavailable = any(s["role"] == "unavailable" for s in user_signups)
-
-        # First interaction with this match → count as a response
-        if not user_signups:
-            db.increment_talent_response(user_id, username, display_name)
 
         # Remove all existing signups for this user (roles + unavailable)
         db.remove_all_signups_for_user(self.match_id, user_id)

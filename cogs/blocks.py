@@ -25,7 +25,12 @@ class BlocksCog(commands.Cog):
             return False
         if interaction.user.guild_permissions.administrator:
             return True
-        return self.db.is_manager(str(interaction.user.id))
+        if self.db.is_manager(str(interaction.user.id)):
+            return True
+        role_id = self.db.get_config("manager_role_id")
+        if role_id:
+            return any(str(r.id) == role_id for r in interaction.user.roles)
+        return False
 
     @app_commands.command(name="block-day",
                           description="Block a day from broadcast scheduling")

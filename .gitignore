@@ -1,5 +1,6 @@
 .env
 bot.db
+bot.db.backup-*
 __pycache__/
 *.pyc
 .pytest_cache/

@@ -127,6 +127,23 @@ async def create_match_thread(
             f"{admin_mention} — please reply in this thread with the correct role @mentions."
         )
 
+    if not test_mode:
+        lines += [
+            "",
+            "This match is being streamed. Please be aware of the following:",
+            "",
+            "- Announce your team's roster by in-game alias - be sure to label any ringers",
+            "  - All roster members should set their nickname in the [player portal](https://players.dse.gg/profile/edit/)",
+            "- A ready check message will be sent at broadcast call time (30 minutes prior to match start)",
+            "- Always wait for the producer to give the go ahead before initiating anything, specifically draft and match start",
+            "- Use https://statlocker.gg/draft",
+            "- Initial draft is a coinflip to pick position, the loser will pick draft position for consecutive matches in the series",
+            "",
+            "Have fun!!",
+            "",
+            "-# Being broadcasted is a privilege, always abide by our Code of Conduct.",
+        ]
+
     await thread.send("\n".join(lines))
     return thread
 
@@ -135,12 +152,41 @@ async def create_match_thread(
 # Ready Check
 # ---------------------------------------------------------------------------
 
-def _build_ready_check_content(match: dict, responses: dict, bot) -> str:
+def _status_tag(status) -> str:
+    if status is True:
+        return "✅ Ready"
+    if status is False:
+        return "❌ Not Ready"
+    return "⏳ No Response"
+
+
+def _find_team_responder(responses: dict, team_role_id: str, guild) -> Optional[tuple]:
+    """Return (user_id, display_name, status) for the first responder whose
+    Discord member has the given team role, or None if no responder qualifies.
+
+    Iterates responses in insertion order (= click order)."""
+    if not guild or not team_role_id:
+        return None
+    for uid, status in responses.items():
+        member = guild.get_member(int(uid))
+        if not member:
+            continue
+        if any(str(r.id) == team_role_id for r in member.roles):
+            return uid, member.display_name, status
+    return None
+
+
+def _build_ready_check_content(match: dict, responses: dict, bot,
+                                *, guild=None) -> str:
     db = bot.db
     alloc = db.get_allocation(match["id"])
     role_assignments: dict = {}
     if alloc and alloc.get("role_assignments"):
         role_assignments = json.loads(alloc["role_assignments"])
+
+    thread_msg = db.get_thread_message(match["id"]) or {}
+    team1_role_id = thread_msg.get("team1_role_id")
+    team2_role_id = thread_msg.get("team2_role_id")
 
     lines = [
         _SEPARATOR,
@@ -148,7 +194,8 @@ def _build_ready_check_content(match: dict, responses: dict, bot) -> str:
         f"**[{match['division']}] {match['team_home']} vs {match['team_away']}**"
         f" | <t:{match['match_time']}:F>",
         "",
-        "Match is 30 minutes away — please confirm your readiness:",
+        "Match is 30 minutes away — Producer, Observer, and a point of "
+        "contact from each team please confirm your readiness:",
         "",
     ]
 
@@ -161,15 +208,25 @@ def _build_ready_check_content(match: dict, responses: dict, bot) -> str:
         if uid in seen:
             continue
         seen.add(uid)
-        name = assignment["display_name"]
-        status = responses.get(uid)
-        if status is True:
-            tag = "✅ Ready"
-        elif status is False:
-            tag = "❌ Not Ready"
+        lines.append(
+            f"<@{uid}> ({assignment['display_name']}): "
+            f"{_status_tag(responses.get(uid))}"
+        )
+
+    for team_role_id, team_name in (
+        (team1_role_id, match["team_home"]),
+        (team2_role_id, match["team_away"]),
+    ):
+        if not team_role_id:
+            continue
+        rep = _find_team_responder(responses, team_role_id, guild)
+        if rep:
+            uid, display_name, status = rep
+            lines.append(
+                f"**{team_name}** — <@{uid}> ({display_name}): {_status_tag(status)}"
+            )
         else:
-            tag = "⏳ No Response"
-        lines.append(f"<@{uid}> ({name}): {tag}")
+            lines.append(f"**{team_name}** — ⏳ Awaiting team confirmation")
 
     return "\n".join(lines)
 
@@ -197,7 +254,9 @@ class ReadyButton(discord.ui.Button):
         responses = db.get_thread_ready_check_responses(self.match_id)
 
         await interaction.response.edit_message(
-            content=_build_ready_check_content(match, responses, interaction.client),
+            content=_build_ready_check_content(
+                match, responses, interaction.client, guild=interaction.guild
+            ),
             view=self.view,
         )
 
@@ -229,7 +288,9 @@ class NotReadyButton(discord.ui.Button):
 
         await interaction.response.edit_message(
             content=(
-                _build_ready_check_content(match, responses, interaction.client)
+                _build_ready_check_content(
+                    match, responses, interaction.client, guild=interaction.guild
+                )
                 + f"\n\n⚠️ {ping} — <@{interaction.user.id}> is **not ready**."
             ),
             view=self.view,
@@ -272,12 +333,14 @@ async def send_ready_check(bot, match: dict) -> None:
             seen.add(a["user_id"])
             pings.append(f"<@{a['user_id']}>")
 
+    if thread_msg.get("team1_role_id"):
+        pings.append(f"<@&{thread_msg['team1_role_id']}>")
+    if thread_msg.get("team2_role_id"):
+        pings.append(f"<@&{thread_msg['team2_role_id']}>")
+
     ping_line = " ".join(pings)
-    content = (
-        ping_line + "\n\n"
-        + _build_ready_check_content(match, {}, bot)
-        if ping_line else _build_ready_check_content(match, {}, bot)
-    )
+    body = _build_ready_check_content(match, {}, bot, guild=thread.guild)
+    content = (ping_line + "\n\n" + body) if ping_line else body
 
     view = ReadyCheckView(match["id"])
     try:

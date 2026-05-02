@@ -363,9 +363,10 @@ class _CancelBroadcastButton(discord.ui.Button):
                 db.decrement_scheduled_count(fresh_match["team_home"])
                 db.decrement_scheduled_count(fresh_match["team_away"])
 
-        # Collect signed-up talent for notification
+        # Collect signed-up talent for notification (skip those who marked Unavailable)
         signups = db.get_signups_for_match(match_id)
-        all_user_ids = list({s["user_id"] for s in signups})
+        all_user_ids = list({s["user_id"] for s in signups
+                             if s["role"] != "unavailable"})
 
         # Reset allocation and mark match cancelled
         db.reset_allocation(match_id)

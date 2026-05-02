@@ -259,6 +259,10 @@ async def _check_manager(interaction: discord.Interaction) -> bool:
     db = interaction.client.db
     is_admin = interaction.user.guild_permissions.administrator
     is_mgr = db.is_manager(str(interaction.user.id))
+    if not is_mgr:
+        role_id = db.get_config("manager_role_id")
+        if role_id:
+            is_mgr = any(str(r.id) == role_id for r in interaction.user.roles)
     if not is_admin and not is_mgr:
         await interaction.response.send_message(
             "Only managers and administrators can manage proposals.", ephemeral=True
@@ -300,8 +304,9 @@ async def _edit_old_signup_messages(old_info: list[dict], bot,
             f"⚠️ The broadcast schedule has been updated. New sign-up posts have been sent."
         )
         ping_text = None
-        if signups:
-            user_ids = list(dict.fromkeys(s["user_id"] for s in signups))
+        notifiable = [s for s in signups if s["role"] != "unavailable"]
+        if notifiable:
+            user_ids = list(dict.fromkeys(s["user_id"] for s in notifiable))
             mentions = " ".join(f"<@{uid}>" for uid in user_ids)
             content += (
                 f"\n\n{mentions} — the schedule has changed. "

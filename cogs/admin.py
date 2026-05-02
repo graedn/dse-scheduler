@@ -21,12 +21,17 @@ class AdminCog(commands.Cog):
         return interaction.user.guild_permissions.administrator
 
     def _manager_check(self, interaction: discord.Interaction) -> bool:
-        """Passes for Discord administrators and users added via /add-manager."""
+        """Passes for administrators, DB managers, or users with the manager Discord role."""
         if not interaction.guild:
             return False
         if interaction.user.guild_permissions.administrator:
             return True
-        return self.db.is_manager(str(interaction.user.id))
+        if self.db.is_manager(str(interaction.user.id)):
+            return True
+        role_id = self.db.get_config("manager_role_id")
+        if role_id:
+            return any(str(r.id) == role_id for r in interaction.user.roles)
+        return False
 
     @app_commands.command(name="set-match-channel",
                           description="Set the channel to watch for match posts")

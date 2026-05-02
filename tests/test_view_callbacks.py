@@ -221,6 +221,41 @@ class TestRejectButton:
         assert "rejected" in interaction.response.edit_message.call_args[1]["content"]
         mock_alloc.assert_called_once()
 
+    async def test_reject_marks_user_unavailable_and_shows_rejected_tag(self, db):
+        """After clicking Reject, the rejecter's sign-up becomes 'unavailable',
+        their unavailable_count increments, and the confirmation message content
+        shows [Rejected] for them."""
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra, conf_msg_id="70001")
+        # Existing role signup for u1 — should be replaced by 'unavailable'.
+        db.upsert_signup(match_id, "m1", "producer", "1", "u1", "User1")
+        # Broadcast message row so RejectButton can resolve signup_message_id.
+        db.insert_broadcast_message(match_id, "m1", "222")
+        db.set_config("log_channel_id", "111")
+        db.set_config("broadcast_channel_id", "222")
+
+        button = self._button_in_view(match_id)
+        interaction = _make_interaction(db, user_id="1", msg_id="70001")
+        interaction.client.get_channel.return_value = AsyncMock()
+
+        with patch("cogs.talent.send_allocation_request", new_callable=AsyncMock):
+            await button.callback(interaction)
+
+        # Sign-up is now 'unavailable' (prior role rows removed)
+        sigs_for_u1 = [s for s in db.get_signups_for_match(match_id)
+                       if s["user_id"] == "1"]
+        assert len(sigs_for_u1) == 1
+        assert sigs_for_u1[0]["role"] == "unavailable"
+
+        # Talent counter: unavailable_count == 1
+        row = next(r for r in db.get_all_talent() if r["user_id"] == "1")
+        assert row["unavailable_count"] == 1
+
+        # Edited content includes the [Rejected] tag for the decliner
+        content = interaction.response.edit_message.call_args[1]["content"]
+        assert "[Rejected]" in content
+
 
 # ===========================================================================
 # M8 — _finalize_match
@@ -675,6 +710,108 @@ class TestCancelBroadcast:
         signup_msg.edit.assert_called_once()
         content = signup_msg.edit.call_args[1]["content"]
         assert "CANCELLED" in content
+
+
+# ===========================================================================
+# UnavailableButton — talent counter behaviour
+# ===========================================================================
+
+class TestUnavailableButton:
+    def _button_and_view(self, match_id):
+        from cogs.signup import SignUpView, UnavailableButton
+        view = SignUpView(match_id)
+        button = next(c for c in view.children if isinstance(c, UnavailableButton))
+        return button, view
+
+    def _interaction(self, db_instance, user_id="1", display_name="Alice"):
+        interaction = _make_interaction(db_instance, user_id=user_id, msg_id="sm_1")
+        member = MagicMock()
+        member.display_name = display_name
+        member.__str__ = lambda self: f"user#{user_id}"
+        interaction.guild.fetch_member = AsyncMock(return_value=member)
+        return interaction
+
+    async def test_unavailable_click_does_not_increment_response_count(self, db):
+        """Regression: clicking Unavailable on a fresh match must NOT add
+        to response_count — only unavailable_count should go up."""
+        match_id = _insert_match(db)
+        db.insert_broadcast_message(match_id, "sm_1", "999")
+
+        button, _view = self._button_and_view(match_id)
+        interaction = self._interaction(db, user_id="1", display_name="Alice")
+
+        await button.callback(interaction)
+
+        row = next(r for r in db.get_all_talent() if r["user_id"] == "1")
+        assert row["unavailable_count"] == 1
+        assert row["response_count"] == 0
+
+    async def test_unavailable_toggle_off_does_not_increment(self, db):
+        """Clicking Unavailable twice (toggle off) must not keep adding to
+        unavailable_count on the un-toggle click."""
+        match_id = _insert_match(db)
+        db.insert_broadcast_message(match_id, "sm_1", "999")
+
+        button, _view = self._button_and_view(match_id)
+        interaction = self._interaction(db, user_id="1", display_name="Alice")
+
+        await button.callback(interaction)
+        await button.callback(interaction)
+
+        row = next(r for r in db.get_all_talent() if r["user_id"] == "1")
+        assert row["unavailable_count"] == 1
+        assert row["response_count"] == 0
+
+
+# ===========================================================================
+# send_allocation_request — filter out 'unavailable' signups
+# ===========================================================================
+
+class TestSendAllocationRequestFiltersUnavailable:
+    async def test_unavailable_signups_excluded_from_allocation_view(self, db):
+        """Users who clicked Unavailable must not appear as options in the
+        AllocationView sent to the log channel."""
+        from cogs.talent import send_allocation_request, AllocationView
+        match_id = _insert_match(db)
+        # One normal role signup and one unavailable signup
+        db.upsert_signup(match_id, "sm_1", "producer", "1", "u1", "Alice")
+        db.upsert_signup(match_id, "sm_1", "unavailable", "2", "u2", "Bob")
+
+        log_ch = AsyncMock()
+        log_ch.send = AsyncMock(return_value=MagicMock(id=999))
+        match = db.get_match(match_id)
+
+        await send_allocation_request(db, match, log_ch, AsyncMock())
+
+        log_ch.send.assert_called_once()
+        view_arg = log_ch.send.call_args[1].get("view") or log_ch.send.call_args[0][1]
+        assert isinstance(view_arg, AllocationView)
+        signup_user_ids = {s["user_id"] for s in view_arg.signups}
+        assert "1" in signup_user_ids
+        assert "2" not in signup_user_ids
+
+    async def test_allocation_view_built_with_filtered_signups_excludes_unavailable(self, db):
+        """AllocationView constructed via send_allocation_request receives
+        signups with 'unavailable' rows filtered out."""
+        from cogs.talent import send_allocation_request, AllocationView
+        match_id = _insert_match(db)
+        for role, uid, name in [("producer", "1", "Alice"),
+                                 ("observer", "2", "Bob"),
+                                 ("unavailable", "3", "Carol"),
+                                 ("pbp", "4", "Dave")]:
+            db.upsert_signup(match_id, "sm_1", role, uid, f"u{uid}", name)
+
+        log_ch = AsyncMock()
+        log_ch.send = AsyncMock(return_value=MagicMock(id=999))
+        match = db.get_match(match_id)
+
+        await send_allocation_request(db, match, log_ch, AsyncMock())
+
+        view_arg = log_ch.send.call_args[1].get("view") or log_ch.send.call_args[0][1]
+        assert isinstance(view_arg, AllocationView)
+        ids_in_view = {s["user_id"] for s in view_arg.signups}
+        assert ids_in_view == {"1", "2", "4"}
+        assert "Carol" not in log_ch.send.call_args[0][0]
 
 
 # ===========================================================================
