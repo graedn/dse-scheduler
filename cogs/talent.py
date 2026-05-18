@@ -531,3 +531,80 @@ async def send_allocation_request(db: Database, match: dict,
         db.set_allocation_message(match["id"], str(msg.id), str(log_channel.id))
     except Exception as e:
         log.error("Failed to send allocation request for match %s: %s", match["id"], e)
+
+
+# ---------------------------------------------------------------------------
+# Single-role swap
+# ---------------------------------------------------------------------------
+
+_ROLE_LABEL_BY_KEY = {
+    "producer": "Producer", "observer": "Observer",
+    "pbp_1": "Play-by-Play", "colour_1": "Colour Caster",
+    "host": "Host", "analyst_1": "Analyst",
+}
+
+
+async def replace_allocation_role(bot, db, match_id: int, role_key: str,
+                                   new_assignment: dict | None) -> None:
+    """Swap one role's assignee (or clear an optional role). Resets only the
+    incoming person's confirmation; preserves everyone else; does NOT change
+    allocation status (an accepted broadcast stays accepted). Edits the
+    existing confirmation message in place and pings only the new person."""
+    import json
+    from cogs.confirm_view import build_confirmation_message
+
+    alloc = db.get_allocation(match_id)
+    if not alloc:
+        return
+    role_assignments = json.loads(alloc.get("role_assignments") or "{}")
+    confirmations = json.loads(alloc.get("confirmations") or "{}")
+
+    old = role_assignments.get(role_key)
+    if old:
+        old_uid = old["user_id"]
+        holds_other = any(
+            isinstance(a, dict) and a.get("user_id") == old_uid
+            for k, a in role_assignments.items() if k != role_key
+        )
+        if not holds_other:
+            confirmations.pop(old_uid, None)
+
+    if new_assignment is None:
+        role_assignments.pop(role_key, None)
+    else:
+        role_assignments[role_key] = new_assignment
+        nuid = new_assignment["user_id"]
+        if confirmations.get(nuid) is not True:
+            confirmations[nuid] = None
+
+    db.update_allocation_lineup(match_id, role_assignments, confirmations)
+
+    match = db.get_match(match_id)
+    msg_id = alloc.get("confirmation_message_id")
+    ch_id = alloc.get("confirmation_channel_id")
+    if not match or not msg_id or not ch_id:
+        return
+    channel = bot.get_channel(int(ch_id))
+    if not channel:
+        return
+    try:
+        msg = await channel.fetch_message(int(msg_id))
+        await msg.edit(content=build_confirmation_message(
+            match, role_assignments, confirmations))
+    except Exception as e:
+        log.warning("replace_allocation_role: edit failed for match %s: %s",
+                    match_id, e)
+
+    if new_assignment is not None:
+        label = _ROLE_LABEL_BY_KEY.get(role_key, role_key)
+        ts = match["match_time"]
+        try:
+            await channel.send(
+                f"<@{new_assignment['user_id']}> — you've been assigned "
+                f"**{label}** for **[{match['division']}] "
+                f"{match['team_home']} vs {match['team_away']}** | <t:{ts}:F>. "
+                f"Please confirm on the message above."
+            )
+        except Exception as e:
+            log.warning("replace_allocation_role: ping failed for match %s: %s",
+                        match_id, e)

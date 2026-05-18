@@ -1122,3 +1122,63 @@ class TestOptionalDoesNotGate:
         with patch("cogs.confirm_view._finalize_match", new_callable=AsyncMock) as fin:
             await button.callback(interaction)
         fin.assert_not_called()
+
+
+# ===========================================================================
+# Task 7 — replace_allocation_role
+# ===========================================================================
+
+class TestReplaceAllocationRole:
+    async def test_swap_resets_only_new_person_keeps_others(self, db):
+        from cogs.talent import replace_allocation_role
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra, conf_msg_id="7001", conf_ch_id="900")
+        db.set_confirmation(match_id, "1", True)
+        db.set_confirmation(match_id, "2", True)
+        db.set_confirmation(match_id, "3", True)
+        db.set_allocation_status(match_id, "accepted")
+
+        ch = AsyncMock()
+        fetched = AsyncMock(); fetched.content = "OLD"; fetched.edit = AsyncMock()
+        ch.fetch_message = AsyncMock(return_value=fetched)
+        ch.send = AsyncMock()
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=ch)
+
+        new_person = {"user_id": "7", "username": "u7", "display_name": "New7"}
+        await replace_allocation_role(bot, db, match_id, "colour_1", new_person)
+
+        import json
+        a = db.get_allocation(match_id)
+        ra2 = json.loads(a["role_assignments"])
+        confs = json.loads(a["confirmations"])
+        assert ra2["colour_1"]["user_id"] == "7"
+        assert confs["7"] is None
+        assert confs["1"] is True
+        assert confs["2"] is True
+        assert "3" not in confs
+        assert a["status"] == "accepted"
+        fetched.edit.assert_awaited()
+        ch.send.assert_awaited()
+        ping = ch.send.call_args
+        assert "<@7>" in str(ping)
+
+    async def test_outgoing_kept_if_holds_other_role(self, db):
+        from cogs.talent import replace_allocation_role
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")  # u1 = producer AND observer
+        _setup_allocation(db, match_id, ra, conf_msg_id="7002", conf_ch_id="900")
+        db.set_confirmation(match_id, "1", True)
+        bot = MagicMock(); bot.db = db
+        ch = AsyncMock()
+        ch.fetch_message = AsyncMock(return_value=AsyncMock(content="x", edit=AsyncMock()))
+        ch.send = AsyncMock()
+        bot.get_channel = MagicMock(return_value=ch)
+
+        await replace_allocation_role(bot, db, match_id, "observer",
+                                      {"user_id": "5", "username": "u5", "display_name": "F5"})
+        import json
+        confs = json.loads(db.get_allocation(match_id)["confirmations"])
+        assert confs["1"] is True   # u1 still producer -> confirmation kept
+        assert confs["5"] is None
