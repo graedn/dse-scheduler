@@ -290,6 +290,19 @@ class Database:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_scheduled_match_at_time_in_week(self, match_time: int,
+                                            week_start_ts: int,
+                                            week_end_ts: int) -> Optional[dict]:
+        """First scheduled (teamup_event_id present) match at exactly match_time
+        within the Mon–Sun ET window. Used to detect a same-time opponent swap."""
+        row = self.conn.execute(
+            "SELECT * FROM matches WHERE match_time = ? "
+            "AND match_time >= ? AND match_time <= ? "
+            "AND teamup_event_id IS NOT NULL LIMIT 1",
+            (match_time, week_start_ts, week_end_ts)
+        ).fetchone()
+        return dict(row) if row else None
+
     def delete_match_cascade(self, match_id: int) -> None:
         """Delete a match and all dependent rows (signups, broadcast message, allocation, thread)."""
         self.conn.execute("DELETE FROM broadcast_signups WHERE match_id = ?", (match_id,))

@@ -791,6 +791,22 @@ def test_get_match_by_teams_in_week_different_teams_not_found(db):
     assert result is None
 
 
+def test_get_scheduled_match_at_time_in_week(db):
+    # scheduled (has teamup_event_id) at t=5000
+    m1 = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                         match_time=5000, posted_at=1)
+    db.update_match_teamup_id(m1, "evt1")
+    # unscheduled at same time — must be ignored
+    db.insert_match(division="D1", week="W1", team_home="C", team_away="D",
+                    match_time=5000, posted_at=1)
+
+    found = db.get_scheduled_match_at_time_in_week(5000, 0, 10000)
+    assert found is not None and found["id"] == m1
+
+    assert db.get_scheduled_match_at_time_in_week(9999, 0, 10000) is None
+    assert db.get_scheduled_match_at_time_in_week(5000, 6000, 10000) is None
+
+
 # --- delete_match_cascade ---
 
 def test_delete_match_cascade_removes_match(db):
