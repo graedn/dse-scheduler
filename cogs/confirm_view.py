@@ -15,6 +15,8 @@ _DISPLAY_ORDER = [
     ("analyst_1", "Analyst",       False),
 ]
 
+_DISPLAY_LABEL = {k: lbl for k, lbl, _ in _DISPLAY_ORDER}
+
 
 async def cancel_orphaned_confirmation(bot, db, match_id: int,
                                         reason: str | None = None) -> None:
@@ -288,61 +290,69 @@ class RejectButton(discord.ui.Button):
         match_id = alloc["match_id"]
         match = db.get_match(match_id)
         role_assignments = json.loads(alloc.get("role_assignments") or "{}")
-        decliner = next(
-            (a for a in role_assignments.values()
+
+        # Which role did this user hold?
+        rejected_key = next(
+            (k for k, a in role_assignments.items()
              if isinstance(a, dict) and a.get("user_id") == user_id),
             None,
         )
+        decliner = role_assignments.get(rejected_key) if rejected_key else None
         name = decliner["display_name"] if decliner else f"<@{user_id}>"
 
-        # Build the rejected-state message BEFORE resetting allocation so the
-        # decliner shows [Rejected] in the final rendered text.
         fresh_conf = db.get_confirmations(match_id)
-        rejected_content = build_confirmation_message(match, role_assignments, fresh_conf)
+        rejected_content = build_confirmation_message(
+            match, role_assignments, fresh_conf)
 
-        # Mark the decliner as unavailable on the sign-up so they're excluded
-        # from the re-opened allocation dropdowns.
+        # Mark the decliner Unavailable so they drop out of candidate lists.
         if decliner:
             bcast = db.get_broadcast_message(match_id)
             signup_message_id = str(bcast["discord_message_id"]) if bcast else ""
             db.remove_all_signups_for_user(match_id, user_id)
             db.upsert_signup(
-                match_id=match_id,
-                message_id=signup_message_id,
-                role="unavailable",
-                user_id=user_id,
+                match_id=match_id, message_id=signup_message_id,
+                role="unavailable", user_id=user_id,
                 username=decliner["username"],
                 display_name=decliner["display_name"],
             )
             db.increment_talent_unavailable(
-                user_id, decliner["username"], decliner["display_name"]
-            )
+                user_id, decliner["username"], decliner["display_name"])
 
-        db.reset_allocation(match_id)
-
+        # Re-render the confirmation message in place ([Rejected] shows). The
+        # ConfirmationView buttons stay live for everyone else.
         await interaction.response.edit_message(
-            content=rejected_content
-                    + f"\n\n❌ **{name}** rejected — re-opening allocation.",
-            view=discord.ui.View(),
-        )
+            content=rejected_content, view=self.view)
 
         log_ch_id = db.get_config("log_channel_id")
-        broadcast_ch_id = db.get_config("broadcast_channel_id")
-        log_ch = interaction.client.get_channel(int(log_ch_id)) if log_ch_id else None
-        broadcast_ch = interaction.client.get_channel(int(broadcast_ch_id)) if broadcast_ch_id else None
+        log_ch = (interaction.client.get_channel(int(log_ch_id))
+                  if log_ch_id else None)
+        manager_role_id = db.get_config("manager_role_id")
+        mgr = f"<@&{manager_role_id}> " if manager_role_id else ""
+        label = _DISPLAY_LABEL.get(rejected_key, rejected_key or "role")
+        required = rejected_key in ("producer", "observer", "pbp_1", "colour_1")
 
-        if log_ch:
+        if not log_ch:
+            return
+
+        if required:
+            from cogs.talent import ReplaceRoleView
+            avail = [s for s in db.get_signups_for_match(match_id)
+                     if s["role"] != "unavailable"]
             await log_ch.send(
-                f"❌ **{name}** declined for "
-                f"**[{match['division']}] {match['team_home']} vs {match['team_away']}**. "
-                f"Re-opening talent allocation."
+                f"{mgr}❌ **{name}** rejected **{label}** for "
+                f"**[{match['division']}] {match['team_home']} vs "
+                f"{match['team_away']}**. Pick a replacement — only the new "
+                f"person will be pinged.",
+                view=ReplaceRoleView(match_id, db, avail,
+                                     preselect_role=rejected_key),
             )
-
-        from cogs.talent import send_allocation_request
-        await send_allocation_request(
-            db, match, log_ch, broadcast_ch,
-            get_teamup=interaction.client.get_teamup,
-        )
+        else:
+            await log_ch.send(
+                f"{mgr}⚠️ **{name}** rejected the optional **{label}** for "
+                f"**[{match['division']}] {match['team_home']} vs "
+                f"{match['team_away']}**. Use **Edit Allocation** on the "
+                f"sign-up message to replace them if needed."
+            )
 
 
 class ConfirmationView(discord.ui.View):

@@ -194,7 +194,7 @@ class TestRejectButton:
         interaction.response.send_message.assert_called_once()
         assert "not required" in interaction.response.send_message.call_args[0][0]
 
-    async def test_reject_edits_message_and_reopens_allocation(self, db):
+    async def test_reject_edits_message_and_posts_replace_view(self, db):
         match_id = _insert_match(db)
         ra = _role_assignments("1", "2", "3")
         _setup_allocation(db, match_id, ra, conf_msg_id="60001")
@@ -213,13 +213,21 @@ class TestRejectButton:
         interaction = _make_interaction(db, user_id="1", msg_id="60001")
         interaction.client.get_channel.side_effect = _get_ch
 
-        # send_allocation_request is imported locally inside callback
-        with patch("cogs.talent.send_allocation_request", new_callable=AsyncMock) as mock_alloc:
-            await button.callback(interaction)
+        await button.callback(interaction)
 
+        # Confirmation message edited in place; decliner shows [Rejected].
         interaction.response.edit_message.assert_called_once()
-        assert "rejected" in interaction.response.edit_message.call_args[1]["content"]
-        mock_alloc.assert_called_once()
+        assert "[Rejected]" in interaction.response.edit_message.call_args[1]["content"]
+
+        # Allocation is NOT reset (single-role replace, not full re-allocation).
+        a = db.get_allocation(match_id)
+        assert a["role_assignments"] is not None
+        assert a["status"] == "awaiting_confirm"
+
+        # Required-role rejecter → a pre-selected ReplaceRoleView is posted.
+        from cogs.talent import ReplaceRoleView
+        sent_views = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
+        assert any(isinstance(v, ReplaceRoleView) for v in sent_views)
 
     async def test_reject_marks_user_unavailable_and_shows_rejected_tag(self, db):
         """After clicking Reject, the rejecter's sign-up becomes 'unavailable',
@@ -255,6 +263,55 @@ class TestRejectButton:
         # Edited content includes the [Rejected] tag for the decliner
         content = interaction.response.edit_message.call_args[1]["content"]
         assert "[Rejected]" in content
+
+
+class TestRejectSingleRoleReplace:
+    def _btn(self, match_id):
+        from cogs.confirm_view import ConfirmationView, RejectButton
+        v = ConfirmationView(match_id)
+        return next(c for c in v.children if isinstance(c, RejectButton))
+
+    async def test_required_reject_posts_replace_view_no_reset(self, db):
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra, conf_msg_id="70001")
+        db.set_config("log_channel_id", "111")
+        db.set_confirmation(match_id, "2", True)
+        log_ch = AsyncMock()
+        btn = self._btn(match_id)
+        interaction = _make_interaction(db, user_id="3", msg_id="70001")  # colour_1 rejects
+        interaction.client.get_channel = MagicMock(return_value=log_ch)
+
+        await btn.callback(interaction)
+
+        a = db.get_allocation(match_id)
+        assert a["role_assignments"] is not None
+        assert a["status"] == "awaiting_confirm"
+        assert db.get_confirmations(match_id).get("2") is True
+        from cogs.talent import ReplaceRoleView
+        sent_views = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
+        assert any(isinstance(v, ReplaceRoleView) for v in sent_views)
+
+    async def test_optional_reject_flags_only(self, db):
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        ra["host"] = {"user_id": "8", "username": "u8", "display_name": "H8"}
+        _setup_allocation(db, match_id, ra, conf_msg_id="70002")
+        db.set_config("log_channel_id", "111")
+        db.set_confirmation(match_id, "8", None)
+        log_ch = AsyncMock()
+        btn = self._btn(match_id)
+        interaction = _make_interaction(db, user_id="8", msg_id="70002")
+        interaction.client.get_channel = MagicMock(return_value=log_ch)
+
+        await btn.callback(interaction)
+
+        from cogs.talent import ReplaceRoleView
+        sent_views = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
+        assert not any(isinstance(v, ReplaceRoleView) for v in sent_views)
+        assert any("rejected the optional" in str(c).lower()
+                   for c in log_ch.send.call_args_list)
+        assert db.get_allocation(match_id)["status"] == "awaiting_confirm"
 
 
 # ===========================================================================
