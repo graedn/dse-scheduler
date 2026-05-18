@@ -554,10 +554,10 @@ class TestBuildConfirmationMessage:
         ra = self._ra()
         confs = {"1": None, "2": None, "3": None, "4": None}
         content = build_confirmation_message(self._match(), ra, confs)
-        # Host is optional — should not show [No Response]
+        # Host is optional — now shows a status tag like required roles
         lines = [l for l in content.splitlines() if "Eve" in l]
         assert lines
-        assert "No Response" not in lines[0]
+        assert "[No Response]" in lines[0]
         assert "optional" in lines[0].lower()
 
     def test_shows_single_pbp_and_colour(self):
@@ -594,6 +594,30 @@ class TestBuildConfirmationMessage:
         confs = {"1": True, "2": None, "3": None, "4": None}
         content = build_confirmation_message(self._match(), ra, confs)
         assert "[Ready]" in content
+
+
+class TestOptionalRendering:
+    def _match(self):
+        return {"division": "D1", "team_home": "A", "team_away": "B",
+                "match_time": 1700000000}
+
+    def test_optional_shows_status_tag_and_awaits(self):
+        from cogs.confirm_view import build_confirmation_message
+        ra = {
+            "producer":  {"user_id": "1", "username": "u1", "display_name": "P"},
+            "observer":  {"user_id": "1", "username": "u1", "display_name": "P"},
+            "pbp_1":     {"user_id": "2", "username": "u2", "display_name": "PB"},
+            "colour_1":  {"user_id": "3", "username": "u3", "display_name": "C"},
+            "host":      {"user_id": "8", "username": "u8", "display_name": "H8"},
+            "analyst_1": {"user_id": "9", "username": "u9", "display_name": "A9"},
+        }
+        confs = {"1": True, "2": True, "3": True, "8": None, "9": False}
+        content = build_confirmation_message(self._match(), ra, confs)
+        assert "**Host** (optional): <@8> — H8 [No Response]" in content
+        assert "**Analyst** (optional): <@9> — A9 [Rejected]" in content
+        awaiting = content.split("Awaiting confirmation from:")[-1]
+        assert "<@8>" in awaiting
+        assert "<@9>" not in awaiting
 
 
 class TestBuildTalentDescription:

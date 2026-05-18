@@ -58,6 +58,14 @@ def build_confirmation_message(match: dict, role_assignments: dict,
         "",
     ]
 
+    def _tag(uid):
+        status = confirmations.get(uid)
+        if status is True:
+            return "[Ready]"
+        if status is False:
+            return "[Rejected]"
+        return "[No Response]"
+
     for key, label, required in _DISPLAY_ORDER:
         assignment = role_assignments.get(key)
         if not assignment:
@@ -65,23 +73,14 @@ def build_confirmation_message(match: dict, role_assignments: dict,
         uid = assignment["user_id"]
         name = assignment["display_name"]
         if required:
-            status = confirmations.get(uid)
-            if status is True:
-                tag = "[Ready]"
-            elif status is False:
-                tag = "[Rejected]"
-            else:
-                tag = "[No Response]"
-            lines.append(f"**{label}:** <@{uid}> — {name} {tag}")
+            lines.append(f"**{label}:** <@{uid}> — {name} {_tag(uid)}")
         else:
-            lines.append(f"**{label}** (optional): <@{uid}> — {name}")
+            lines.append(f"**{label}** (optional): <@{uid}> — {name} {_tag(uid)}")
 
-    # Awaiting mentions (only required users who haven't responded)
+    # Awaiting mentions: any assigned user (required or optional) still pending
     awaiting = []
     seen_awaiting: set[str] = set()
-    for key, _label, required in _DISPLAY_ORDER:
-        if not required:
-            continue
+    for key, _label, _required in _DISPLAY_ORDER:
         a = role_assignments.get(key)
         if a:
             uid = a["user_id"]
