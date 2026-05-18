@@ -499,6 +499,27 @@ def test_set_allocation_status(db):
     assert db.get_allocation(mid)["status"] == "accepted"
 
 
+def test_update_allocation_lineup_preserves_status_and_message(db):
+    mid = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                          match_time=1000, posted_at=900)
+    db.create_allocation(mid)
+    db.set_allocation_assignments(
+        mid, {"producer": {"user_id": "u1", "username": "x", "display_name": "U1"}},
+        {"u1": True}, "cmsg", "cch")
+    db.set_allocation_status(mid, "accepted")
+
+    new_ra = {"producer": {"user_id": "u9", "username": "y", "display_name": "U9"}}
+    db.update_allocation_lineup(mid, new_ra, {"u9": None})
+
+    a = db.get_allocation(mid)
+    import json
+    assert json.loads(a["role_assignments"]) == new_ra
+    assert json.loads(a["confirmations"]) == {"u9": None}
+    assert a["status"] == "accepted"            # NOT downgraded
+    assert a["confirmation_message_id"] == "cmsg"
+    assert a["confirmation_channel_id"] == "cch"
+
+
 def test_copy_allocation_copies_row_verbatim(db):
     old = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
                           match_time=1000, posted_at=900)

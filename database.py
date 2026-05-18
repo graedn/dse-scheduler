@@ -765,6 +765,19 @@ class Database:
         )
         self.conn.commit()
 
+    def update_allocation_lineup(self, match_id: int, role_assignments: dict,
+                                 confirmations: dict) -> None:
+        """Update role_assignments + confirmations only, leaving status,
+        confirmation_message_id and channel intact (used by single-role swaps
+        so an accepted broadcast is not downgraded)."""
+        self.conn.execute(
+            "UPDATE talent_allocations SET role_assignments = ?, confirmations = ?, "
+            "updated_at = ? WHERE match_id = ?",
+            (json.dumps(role_assignments), json.dumps(confirmations),
+             int(time.time()), match_id)
+        )
+        self.conn.commit()
+
     def set_confirmation(self, match_id: int, user_id: str, confirmed: bool) -> None:
         row = self.conn.execute(
             "SELECT confirmations FROM talent_allocations WHERE match_id = ?",
