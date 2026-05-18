@@ -671,6 +671,48 @@ class SignUpView(discord.ui.View):
         self.add_item(BlockDayButton(match_id))
 
 
+class EditAllocationButton(discord.ui.Button):
+    def __init__(self, match_id: int):
+        self.match_id = match_id
+        super().__init__(
+            label="Edit Allocation",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"edit_alloc_{match_id}",
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        db = interaction.client.db
+        if not _manager_check(interaction, db):
+            await interaction.response.send_message(
+                "Only managers and administrators can use this button.", ephemeral=True
+            )
+            return
+        match = db.get_match(self.match_id)
+        if not match:
+            await interaction.response.send_message(
+                "Match not found.", ephemeral=True)
+            return
+        log_ch_id = db.get_config("log_channel_id")
+        log_ch = interaction.client.get_channel(int(log_ch_id)) if log_ch_id else None
+        if not log_ch:
+            await interaction.response.send_message(
+                "Log channel not configured.", ephemeral=True)
+            return
+        from cogs.talent import ReplaceRoleView
+        avail = [s for s in db.get_signups_for_match(self.match_id)
+                 if s["role"] != "unavailable"]
+        await log_ch.send(
+            f"✏️ **Editing allocation** — **[{match['division']}] "
+            f"{match['team_home']} vs {match['team_away']}** | "
+            f"<t:{match['match_time']}:F>\n"
+            f"Pick a role and a replacement. Only the changed person is pinged.",
+            view=ReplaceRoleView(self.match_id, db, avail),
+        )
+        await interaction.response.send_message(
+            "Allocation editor posted in the log channel.", ephemeral=True)
+
+
 class ApprovedSignUpView(discord.ui.View):
     """Persistent view shown on sign-up messages after talent confirmation is complete.
     Only New Match, Block Day, and Create Thread remain active."""
@@ -680,3 +722,4 @@ class ApprovedSignUpView(discord.ui.View):
         self.add_item(NewMatchButton(match_id))
         self.add_item(BlockDayButton(match_id))
         self.add_item(CreateThreadButton(match_id))
+        self.add_item(EditAllocationButton(match_id))

@@ -1285,3 +1285,34 @@ class TestReplaceRoleView:
         await button.callback(interaction)
         interaction.response.send_message.assert_called_once()
         assert "manager" in interaction.response.send_message.call_args[0][0].lower()
+
+
+class TestEditAllocationButton:
+    def _btn(self, match_id):
+        from cogs.signup import ApprovedSignUpView, EditAllocationButton
+        v = ApprovedSignUpView(match_id)
+        return next(c for c in v.children if isinstance(c, EditAllocationButton))
+
+    async def test_non_manager_denied(self, db):
+        match_id = _insert_match(db)
+        btn = self._btn(match_id)
+        interaction = _make_interaction(db, user_id="1", is_admin=False)
+        interaction.guild = MagicMock()
+        db.is_manager = MagicMock(return_value=False)
+        await btn.callback(interaction)
+        interaction.response.send_message.assert_called_once()
+        assert "manager" in interaction.response.send_message.call_args[0][0].lower()
+
+    async def test_manager_posts_replace_view_to_log(self, db):
+        match_id = _insert_match(db)
+        _setup_allocation(db, match_id, _role_assignments("1", "2", "3"))
+        db.set_config("log_channel_id", "111")
+        log_ch = AsyncMock()
+        btn = self._btn(match_id)
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+        interaction.client.get_channel = MagicMock(return_value=log_ch)
+        await btn.callback(interaction)
+        from cogs.talent import ReplaceRoleView
+        sent = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
+        assert any(isinstance(v, ReplaceRoleView) for v in sent)
