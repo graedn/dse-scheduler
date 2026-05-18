@@ -806,6 +806,36 @@ class Database:
         )
         self.conn.commit()
 
+    def copy_allocation(self, old_match_id: int, new_match_id: int) -> None:
+        """Copy the talent_allocations row from one match onto another (upsert)."""
+        src = self.conn.execute(
+            "SELECT role_assignments, confirmations, status, "
+            "confirmation_message_id, confirmation_channel_id, "
+            "allocation_message_id, allocation_channel_id "
+            "FROM talent_allocations WHERE match_id = ?",
+            (old_match_id,)
+        ).fetchone()
+        if not src:
+            return
+        now = int(time.time())
+        self.conn.execute(
+            "INSERT OR IGNORE INTO talent_allocations "
+            "(match_id, confirmations, status, created_at, updated_at) "
+            "VALUES (?, '{}', 'pending', ?, ?)",
+            (new_match_id, now, now)
+        )
+        self.conn.execute(
+            "UPDATE talent_allocations SET role_assignments = ?, confirmations = ?, "
+            "status = ?, confirmation_message_id = ?, confirmation_channel_id = ?, "
+            "allocation_message_id = ?, allocation_channel_id = ?, updated_at = ? "
+            "WHERE match_id = ?",
+            (src["role_assignments"], src["confirmations"], src["status"],
+             src["confirmation_message_id"], src["confirmation_channel_id"],
+             src["allocation_message_id"], src["allocation_channel_id"],
+             now, new_match_id)
+        )
+        self.conn.commit()
+
     # --- User settings ---
 
     def get_user_timezone(self, user_id: str) -> str:

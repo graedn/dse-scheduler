@@ -499,6 +499,28 @@ def test_set_allocation_status(db):
     assert db.get_allocation(mid)["status"] == "accepted"
 
 
+def test_copy_allocation_copies_row_verbatim(db):
+    old = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                          match_time=1000, posted_at=900)
+    new = db.insert_match(division="D1", week="W1", team_home="C", team_away="D",
+                          match_time=1000, posted_at=900)
+    db.create_allocation(old)
+    ra = {"producer": {"user_id": "u1", "username": "user1", "display_name": "U1"}}
+    db.set_allocation_assignments(old, ra, {"u1": True}, "msg1", "ch1")
+    db.set_allocation_status(old, "accepted")
+
+    db.copy_allocation(old, new)
+
+    a = db.get_allocation(new)
+    assert a is not None
+    import json
+    assert json.loads(a["role_assignments"]) == ra
+    assert json.loads(a["confirmations"]) == {"u1": True}
+    assert a["status"] == "accepted"
+    assert a["confirmation_message_id"] == "msg1"
+    assert a["confirmation_channel_id"] == "ch1"
+
+
 # --- Mark broadcast accepted ---
 
 def test_mark_broadcast_accepted(db):
