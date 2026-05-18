@@ -738,3 +738,58 @@ class ReplaceRoleView(discord.ui.View):
         self.add_item(_ReplaceCandidateSelect(signups, db))
         self.add_item(_ReplaceApplyButton())
         self.add_item(_ReplaceDoneButton())
+
+
+async def carry_over_if_same_time(bot, db, old_match_id: int,
+                                  new_match_id: int) -> str | None:
+    """If old and new match share match_time, copy sign-ups (and the
+    allocation when one exists) onto the new match so talent are not
+    re-pinged. Returns a short status note, or None when times differ
+    (caller falls back to fresh-start behaviour)."""
+    old = db.get_match(old_match_id)
+    new = db.get_match(new_match_id)
+    if not old or not new or old["match_time"] != new["match_time"]:
+        return None
+
+    db.copy_signups(old_match_id, new_match_id)
+    alloc = db.get_allocation(old_match_id)
+    if not alloc:
+        return "Sign-ups carried over (same time slot)."
+
+    db.copy_allocation(old_match_id, new_match_id)
+    status = alloc.get("status")
+
+    if status in ("awaiting_confirm", "accepted"):
+        import json
+        ra = json.loads(alloc.get("role_assignments") or "{}")
+        confs = json.loads(alloc.get("confirmations") or "{}")
+        msg_id = alloc.get("confirmation_message_id")
+        ch_id = alloc.get("confirmation_channel_id")
+        if msg_id and ch_id:
+            channel = bot.get_channel(int(ch_id))
+            if channel:
+                from cogs.confirm_view import build_confirmation_message
+                try:
+                    msg = await channel.fetch_message(int(msg_id))
+                    await msg.edit(content=build_confirmation_message(
+                        new, ra, confs))
+                except Exception as e:
+                    log.warning("carry_over: edit confirmation failed "
+                                "for match %s: %s", new_match_id, e)
+        updates_ch_id = db.get_config("schedule_updates_channel_id")
+        updates_ch = (bot.get_channel(int(updates_ch_id))
+                      if updates_ch_id else None)
+        if updates_ch:
+            try:
+                await updates_ch.send(
+                    f"♻️ **Opponent changed, same time** — "
+                    f"**[{new['division']}] {new['team_home']} vs "
+                    f"{new['team_away']}** | <t:{new['match_time']}:F>. "
+                    f"Your confirmation still stands — no action needed."
+                )
+            except Exception as e:
+                log.warning("carry_over: notice failed for match %s: %s",
+                            new_match_id, e)
+        return "Crew + confirmations carried over (same time slot)."
+
+    return "Sign-ups carried over (same time slot)."

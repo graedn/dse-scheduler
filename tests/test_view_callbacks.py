@@ -1316,3 +1316,37 @@ class TestEditAllocationButton:
         from cogs.talent import ReplaceRoleView
         sent = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
         assert any(isinstance(v, ReplaceRoleView) for v in sent)
+
+
+class TestCarryOverIfSameTime:
+    async def test_same_time_copies_signups_and_allocation(self, db):
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db)  # default match_time
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=db.get_match(old)["match_time"],
+                              posted_at=1)
+        db.upsert_signup(old, "m", "producer", "1", "u1", "U1")
+        db.create_allocation(old)
+        db.set_allocation_status(old, "accepted")
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=None)
+
+        note = await carry_over_if_same_time(bot, db, old, new)
+
+        assert note is not None
+        assert {s["user_id"] for s in db.get_signups_for_match(new)} == {"1"}
+        assert db.get_allocation(new)["status"] == "accepted"
+
+    async def test_different_time_returns_none_and_copies_nothing(self, db):
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db)
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=db.get_match(old)["match_time"] + 3600,
+                              posted_at=1)
+        db.upsert_signup(old, "m", "producer", "1", "u1", "U1")
+        bot = MagicMock(); bot.db = db
+        note = await carry_over_if_same_time(bot, db, old, new)
+        assert note is None
+        assert db.get_signups_for_match(new) == []
