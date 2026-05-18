@@ -682,6 +682,10 @@ class EditAllocationButton(discord.ui.Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
+            return
+
         db = interaction.client.db
         if not _manager_check(interaction, db):
             await interaction.response.send_message(
@@ -715,7 +719,7 @@ class EditAllocationButton(discord.ui.Button):
 
 class ApprovedSignUpView(discord.ui.View):
     """Persistent view shown on sign-up messages after talent confirmation is complete.
-    Only New Match, Block Day, and Create Thread remain active."""
+    Only New Match, Block Day, Create Thread, and Edit Allocation remain active."""
     def __init__(self, match_id: int):
         from cogs.threads import CreateThreadButton
         super().__init__(timeout=None)
