@@ -263,8 +263,11 @@ class _ConfirmButton(discord.ui.Button):
                         "display_name": s["display_name"],
                     }
 
-        required_ids = _get_required_user_ids(role_assignments)
-        confirmations = {uid: None for uid in required_ids}
+        confirmations: dict = {}
+        for _rk in ("producer", "observer", "pbp_1", "colour_1", "host", "analyst_1"):
+            _a = role_assignments.get(_rk)
+            if isinstance(_a, dict) and _a["user_id"] not in confirmations:
+                confirmations[_a["user_id"]] = None
 
         from cogs.confirm_view import build_confirmation_message, ConfirmationView
         conf_msg = None
@@ -325,6 +328,11 @@ async def _cancel_broadcast(interaction: discord.Interaction, view) -> None:
         view.db.decrement_scheduled_count(match["team_home"])
         view.db.decrement_scheduled_count(match["team_away"])
 
+    from cogs.confirm_view import cancel_orphaned_confirmation
+    await cancel_orphaned_confirmation(
+        interaction.client, view.db, match["id"],
+        reason="the broadcast was cancelled",
+    )
     view.db.reset_allocation(match["id"])
 
     signups = view.db.get_signups_for_match(match["id"])

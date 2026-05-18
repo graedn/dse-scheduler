@@ -16,6 +16,35 @@ _DISPLAY_ORDER = [
 ]
 
 
+async def cancel_orphaned_confirmation(bot, db, match_id: int,
+                                        reason: str | None = None) -> None:
+    """Edit any active talent confirmation message for a match to a cancelled
+    state and remove its buttons.
+
+    MUST be called BEFORE reset_allocation / delete_match_cascade so the
+    confirmation_message_id is still readable. No-op when no confirmation
+    message is associated with the match."""
+    alloc = db.get_allocation(match_id)
+    if not alloc:
+        return
+    msg_id = alloc.get("confirmation_message_id")
+    ch_id = alloc.get("confirmation_channel_id")
+    if not msg_id or not ch_id:
+        return
+    channel = bot.get_channel(int(ch_id))
+    if not channel:
+        return
+    note = reason or "this broadcast was removed from the schedule"
+    try:
+        msg = await channel.fetch_message(int(msg_id))
+        await msg.edit(
+            content=msg.content + f"\n\n⏏️ **Talent confirmation cancelled** — {note}.",
+            view=discord.ui.View(),
+        )
+    except Exception as e:
+        log.warning("cancel_orphaned_confirmation: failed for match %s: %s", match_id, e)
+
+
 def build_confirmation_message(match: dict, role_assignments: dict,
                                 confirmations: dict) -> str:
     """Confirmation message with per-user status ([Ready] / [Rejected] / [No Response])."""
@@ -164,6 +193,22 @@ async def _finalize_match(match: dict, alloc: dict, role_assignments: dict, bot)
             )
 
 
+async def _stale_message_cleanup(interaction: discord.Interaction) -> None:
+    """Edit a stale confirmation message in place (no buttons) so the next
+    talent member who looks at it sees that it's been cancelled instead of
+    clicking and getting a 'no longer active' ephemeral."""
+    suffix = "\n\n⏏️ **Talent confirmation cancelled** — this broadcast is no longer scheduled."
+    if suffix.strip() in (interaction.message.content or ""):
+        return
+    try:
+        await interaction.message.edit(
+            content=(interaction.message.content or "") + suffix,
+            view=discord.ui.View(),
+        )
+    except Exception as e:
+        log.warning("Failed to clean up stale confirmation message: %s", e)
+
+
 class ReadyButton(discord.ui.Button):
     def __init__(self, match_id: int):
         self.match_id = match_id
@@ -181,6 +226,7 @@ class ReadyButton(discord.ui.Button):
             await interaction.response.send_message(
                 "This confirmation is no longer active.", ephemeral=True
             )
+            await _stale_message_cleanup(interaction)
             return
 
         user_id = str(interaction.user.id)
@@ -198,7 +244,9 @@ class ReadyButton(discord.ui.Button):
 
         new_content = build_confirmation_message(match, role_assignments, fresh_conf)
 
-        if all(v is True for v in fresh_conf.values()):
+        from cogs.talent import _get_required_user_ids
+        required_ids = _get_required_user_ids(role_assignments)
+        if required_ids and all(fresh_conf.get(uid) is True for uid in required_ids):
             await interaction.response.edit_message(
                 content=new_content + "\n\n✅ **All talent confirmed — moved to Accepted Calendar!**",
                 view=discord.ui.View(),
@@ -225,6 +273,7 @@ class RejectButton(discord.ui.Button):
             await interaction.response.send_message(
                 "This confirmation is no longer active.", ephemeral=True
             )
+            await _stale_message_cleanup(interaction)
             return
 
         user_id = str(interaction.user.id)

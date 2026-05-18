@@ -713,6 +713,136 @@ class TestCancelBroadcast:
 
 
 # ===========================================================================
+# cancel_orphaned_confirmation helper + stale-click safety net
+# ===========================================================================
+
+class TestCancelOrphanedConfirmation:
+    """The helper edits the active confirmation message into a cancelled state
+    BEFORE reset_allocation/delete_match_cascade wipes the message ID."""
+
+    async def test_edits_message_when_confirmation_present(self, db):
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra,
+                          conf_msg_id="80001", conf_ch_id="888")
+
+        fetched_msg = AsyncMock()
+        fetched_msg.content = "ORIGINAL"
+        fetched_msg.edit = AsyncMock()
+        channel = AsyncMock()
+        channel.fetch_message = AsyncMock(return_value=fetched_msg)
+        bot = MagicMock()
+        bot.get_channel = MagicMock(return_value=channel)
+
+        await cancel_orphaned_confirmation(bot, db, match_id, reason="test reason")
+
+        bot.get_channel.assert_called_once_with(888)
+        channel.fetch_message.assert_awaited_once_with(80001)
+        fetched_msg.edit.assert_awaited_once()
+        new_content = fetched_msg.edit.call_args[1]["content"]
+        assert new_content.startswith("ORIGINAL")
+        assert "Talent confirmation cancelled" in new_content
+        assert "test reason" in new_content
+
+    async def test_no_op_when_confirmation_message_id_missing(self, db):
+        """After reset_allocation, conf_msg_id is NULL — helper must not crash."""
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        match_id = _insert_match(db)
+        db.create_allocation(match_id)  # no confirmation_message_id set
+
+        bot = MagicMock()
+        bot.get_channel = MagicMock()
+
+        await cancel_orphaned_confirmation(bot, db, match_id)
+
+        bot.get_channel.assert_not_called()
+
+    async def test_no_op_when_no_allocation_row(self, db):
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        bot = MagicMock()
+        bot.get_channel = MagicMock()
+
+        await cancel_orphaned_confirmation(bot, db, match_id=99999)
+
+        bot.get_channel.assert_not_called()
+
+    async def test_no_op_when_channel_uncached(self, db):
+        """get_channel returning None (cache miss) is not an error."""
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra,
+                          conf_msg_id="80002", conf_ch_id="999")
+
+        bot = MagicMock()
+        bot.get_channel = MagicMock(return_value=None)
+
+        await cancel_orphaned_confirmation(bot, db, match_id)
+
+        bot.get_channel.assert_called_once_with(999)
+        # No exception raised
+
+
+class TestStaleClickSafetyNet:
+    """When Ready/Reject hits the 'no longer active' branch, the message is
+    edited in place so subsequent talent see the cancellation."""
+
+    async def test_ready_click_on_orphaned_alloc_edits_message(self, db):
+        from cogs.confirm_view import ConfirmationView, ReadyButton
+        match_id = _insert_match(db)
+        # No allocation row at all → "no longer active" branch
+        view = ConfirmationView(match_id)
+        button = next(c for c in view.children if isinstance(c, ReadyButton))
+
+        interaction = _make_interaction(db, user_id="1", msg_id="no_such",
+                                         msg_content="ORIGINAL CONTENT")
+        interaction.message = AsyncMock()
+        interaction.message.id = "no_such"
+        interaction.message.content = "ORIGINAL CONTENT"
+
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        assert "no longer active" in interaction.response.send_message.call_args[0][0]
+        interaction.message.edit.assert_awaited_once()
+        new_content = interaction.message.edit.call_args[1]["content"]
+        assert new_content.startswith("ORIGINAL CONTENT")
+        assert "Talent confirmation cancelled" in new_content
+
+    async def test_reject_click_on_orphaned_alloc_edits_message(self, db):
+        from cogs.confirm_view import ConfirmationView, RejectButton
+        match_id = _insert_match(db)
+        view = ConfirmationView(match_id)
+        button = next(c for c in view.children if isinstance(c, RejectButton))
+
+        interaction = _make_interaction(db, user_id="1", msg_id="no_such",
+                                         msg_content="ORIGINAL CONTENT")
+        interaction.message = AsyncMock()
+        interaction.message.id = "no_such"
+        interaction.message.content = "ORIGINAL CONTENT"
+
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        interaction.message.edit.assert_awaited_once()
+        assert "Talent confirmation cancelled" in interaction.message.edit.call_args[1]["content"]
+
+    async def test_safety_net_idempotent_does_not_double_append(self, db):
+        """If the message has already been cleaned up, don't append again."""
+        from cogs.confirm_view import _stale_message_cleanup
+        suffix = "⏏️ **Talent confirmation cancelled** — this broadcast is no longer scheduled."
+        interaction = MagicMock()
+        interaction.message = AsyncMock()
+        interaction.message.content = "ORIGINAL\n\n" + suffix
+        interaction.message.edit = AsyncMock()
+
+        await _stale_message_cleanup(interaction)
+
+        interaction.message.edit.assert_not_called()
+
+
+# ===========================================================================
 # UnavailableButton — talent counter behaviour
 # ===========================================================================
 
@@ -931,3 +1061,40 @@ class TestNewMatchSelect:
         # A ping with @mentions should be sent
         ping_calls = [c for c in signup_ch.send.call_args_list if "<@" in str(c)]
         assert len(ping_calls) >= 1
+
+
+# ===========================================================================
+# Optional roles tracked in confirmations but never gate finalization
+# ===========================================================================
+
+class TestOptionalDoesNotGate:
+    def _ready(self, match_id):
+        from cogs.confirm_view import ConfirmationView, ReadyButton
+        v = ConfirmationView(match_id)
+        return next(c for c in v.children if isinstance(c, ReadyButton))
+
+    async def test_all_required_ready_finalizes_with_optional_pending(self, db):
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        ra["host"] = {"user_id": "9", "username": "u9", "display_name": "Host9"}
+        _setup_allocation(db, match_id, ra, conf_msg_id="C1")
+        db.set_confirmation(match_id, "9", None)
+        db.set_confirmation(match_id, "2", True)
+        db.set_confirmation(match_id, "3", True)
+        button = self._ready(match_id)
+        interaction = _make_interaction(db, user_id="1", msg_id="C1")
+        with patch("cogs.confirm_view._finalize_match", new_callable=AsyncMock) as fin:
+            await button.callback(interaction)
+        fin.assert_called_once()
+
+    async def test_required_pending_blocks_even_if_optional_ready(self, db):
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        ra["analyst_1"] = {"user_id": "9", "username": "u9", "display_name": "An9"}
+        _setup_allocation(db, match_id, ra, conf_msg_id="C2")
+        db.set_confirmation(match_id, "9", True)
+        button = self._ready(match_id)
+        interaction = _make_interaction(db, user_id="1", msg_id="C2")
+        with patch("cogs.confirm_view._finalize_match", new_callable=AsyncMock) as fin:
+            await button.callback(interaction)
+        fin.assert_not_called()
