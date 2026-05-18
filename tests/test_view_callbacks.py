@@ -247,8 +247,7 @@ class TestRejectButton:
         interaction = _make_interaction(db, user_id="1", msg_id="70001")
         interaction.client.get_channel.return_value = AsyncMock()
 
-        with patch("cogs.talent.send_allocation_request", new_callable=AsyncMock):
-            await button.callback(interaction)
+        await button.callback(interaction)
 
         # Sign-up is now 'unavailable' (prior role rows removed)
         sigs_for_u1 = [s for s in db.get_signups_for_match(match_id)
