@@ -289,6 +289,23 @@ def test_remove_signup_nonexistent_returns_false(db):
     assert db.remove_signup(mid, "pbp", "ghost-user") is False
 
 
+def test_copy_signups_rekeys_rows_to_new_match(db):
+    old = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                          match_time=1000, posted_at=900)
+    new = db.insert_match(division="D1", week="W1", team_home="C", team_away="D",
+                          match_time=1000, posted_at=900)
+    db.upsert_signup(old, "m1", "producer", "u1", "user1", "User One")
+    db.upsert_signup(old, "m1", "unavailable", "u2", "user2", "User Two")
+
+    n = db.copy_signups(old, new)
+
+    assert n == 2
+    new_sigs = {(s["role"], s["user_id"]) for s in db.get_signups_for_match(new)}
+    assert new_sigs == {("producer", "u1"), ("unavailable", "u2")}
+    # old rows untouched
+    assert len(db.get_signups_for_match(old)) == 2
+
+
 # --- Managers ---
 
 def test_add_and_is_manager(db):

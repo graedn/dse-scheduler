@@ -532,6 +532,24 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def copy_signups(self, old_match_id: int, new_match_id: int) -> int:
+        """Copy all broadcast_signups rows from one match to another. Returns count copied."""
+        rows = self.conn.execute(
+            "SELECT role, user_id, username, display_name, signed_up_at "
+            "FROM broadcast_signups WHERE match_id = ?",
+            (old_match_id,)
+        ).fetchall()
+        for r in rows:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO broadcast_signups "
+                "(match_id, message_id, role, user_id, username, display_name, signed_up_at) "
+                "VALUES (?, '', ?, ?, ?, ?, ?)",
+                (new_match_id, r["role"], r["user_id"], r["username"],
+                 r["display_name"], r["signed_up_at"])
+            )
+        self.conn.commit()
+        return len(rows)
+
     def get_all_matches_with_teamup_id(self) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM matches WHERE teamup_event_id IS NOT NULL"
