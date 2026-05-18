@@ -1182,3 +1182,50 @@ class TestReplaceAllocationRole:
         confs = json.loads(db.get_allocation(match_id)["confirmations"])
         assert confs["1"] is True   # u1 still producer -> confirmation kept
         assert confs["5"] is None
+
+
+# ===========================================================================
+# Task 8 — ReplaceRoleView
+# ===========================================================================
+
+class TestReplaceRoleView:
+    def _view(self, db, match_id, signups, role_key=None):
+        from cogs.talent import ReplaceRoleView
+        return ReplaceRoleView(match_id, db, signups, preselect_role=role_key)
+
+    async def test_apply_calls_replace_with_selected_role_and_user(self, db):
+        from cogs.talent import ReplaceRoleView, _ReplaceApplyButton
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra, conf_msg_id="V1", conf_ch_id="900")
+        db.upsert_signup(match_id, "m", "colour", "7", "u7", "New7")
+        signups = db.get_signups_for_match(match_id)
+
+        view = self._view(db, match_id, signups, role_key="colour_1")
+        view.selected_role = "colour_1"
+        view.selected_user = "7"
+        button = next(c for c in view.children if isinstance(c, _ReplaceApplyButton))
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+
+        with patch("cogs.talent.replace_allocation_role",
+                   new_callable=AsyncMock) as rep:
+            await button.callback(interaction)
+
+        rep.assert_awaited_once()
+        args = rep.await_args[0]
+        assert args[2] == match_id and args[3] == "colour_1"
+        assert args[4]["user_id"] == "7"
+
+    async def test_apply_denied_for_non_manager(self, db):
+        from cogs.talent import _ReplaceApplyButton
+        match_id = _insert_match(db)
+        _setup_allocation(db, match_id, _role_assignments("1", "2", "3"))
+        view = self._view(db, match_id, [])
+        button = next(c for c in view.children if isinstance(c, _ReplaceApplyButton))
+        interaction = _make_interaction(db, user_id="1", is_admin=False)
+        interaction.guild = MagicMock()
+        db.is_manager = MagicMock(return_value=False)
+        await button.callback(interaction)
+        interaction.response.send_message.assert_called_once()
+        assert "manager" in interaction.response.send_message.call_args[0][0].lower()

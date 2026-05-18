@@ -608,3 +608,133 @@ async def replace_allocation_role(bot, db, match_id: int, role_key: str,
         except Exception as e:
             log.warning("replace_allocation_role: ping failed for match %s: %s",
                         match_id, e)
+
+
+# ---------------------------------------------------------------------------
+# ReplaceRoleView — manager single-role swap UI (repeatable)
+# ---------------------------------------------------------------------------
+
+_REPLACE_ROLE_OPTIONS = [
+    ("producer",  "Producer"),
+    ("observer",  "Observer"),
+    ("pbp_1",     "Play-by-Play"),
+    ("colour_1",  "Colour Caster"),
+    ("host",      "Host (optional)"),
+    ("analyst_1", "Analyst (optional)"),
+]
+_CLEAR_SENTINEL = "__clear__"
+
+
+def _replace_is_manager(interaction, db) -> bool:
+    if interaction.user.guild_permissions.administrator:
+        return True
+    if db.is_manager(str(interaction.user.id)):
+        return True
+    role_id = db.get_config("manager_role_id")
+    if role_id:
+        return any(str(r.id) == role_id for r in interaction.user.roles)
+    return False
+
+
+class _ReplaceRoleSelect(discord.ui.Select):
+    def __init__(self, preselect_role=None):
+        opts = [
+            discord.SelectOption(label=lbl, value=key,
+                                 default=(key == preselect_role))
+            for key, lbl in _REPLACE_ROLE_OPTIONS
+        ]
+        super().__init__(placeholder="Role to change...", options=opts,
+                         min_values=0, max_values=1, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.selected_role = self.values[0] if self.values else None
+        await interaction.response.defer()
+
+
+class _ReplaceCandidateSelect(discord.ui.Select):
+    def __init__(self, signups, db):
+        avail = [s for s in signups if s["role"] != "unavailable"]
+        opts = _build_all_signup_options(avail, db)
+        if not opts:
+            opts = [discord.SelectOption(label="No sign-ups", value="__none__")]
+        opts.insert(0, discord.SelectOption(
+            label="— Clear (optional roles only) —", value=_CLEAR_SENTINEL))
+        super().__init__(placeholder="Replacement...", options=opts[:25],
+                         min_values=0, max_values=1, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.selected_user = self.values[0] if self.values else None
+        await interaction.response.defer()
+
+
+class _ReplaceApplyButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Apply", style=discord.ButtonStyle.primary, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not _replace_is_manager(interaction, view.db):
+            await interaction.response.send_message(
+                "Only managers and administrators can edit the allocation.",
+                ephemeral=True)
+            return
+        role_key = view.selected_role
+        sel = view.selected_user
+        if not role_key or sel is None:
+            await interaction.response.send_message(
+                "Pick a role and a replacement first.", ephemeral=True)
+            return
+        if sel == _CLEAR_SENTINEL:
+            if role_key not in ("host", "analyst_1"):
+                await interaction.response.send_message(
+                    "Only optional roles (Host/Analyst) can be cleared.",
+                    ephemeral=True)
+                return
+            new_assignment = None
+        elif sel == "__none__":
+            await interaction.response.send_message(
+                "No sign-ups available to assign.", ephemeral=True)
+            return
+        else:
+            s = next((x for x in view.signups if x["user_id"] == sel), None)
+            if not s:
+                await interaction.response.send_message(
+                    "That person is no longer available.", ephemeral=True)
+                return
+            new_assignment = {
+                "user_id": s["user_id"], "username": s["username"],
+                "display_name": s["display_name"],
+            }
+        await replace_allocation_role(
+            interaction.client, view.db, view.match_id, role_key, new_assignment)
+        await interaction.response.send_message(
+            f"✅ Updated **{_ROLE_LABEL_BY_KEY.get(role_key, role_key)}**. "
+            f"Only the new person was pinged.", ephemeral=True)
+
+
+class _ReplaceDoneButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Done", style=discord.ButtonStyle.secondary, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.stop()
+        for c in self.view.children:
+            c.disabled = True
+        await interaction.response.edit_message(
+            content=interaction.message.content + "\n\n☑️ **Allocation edit closed.**",
+            view=self.view)
+
+
+class ReplaceRoleView(discord.ui.View):
+    def __init__(self, match_id: int, db, signups: list[dict],
+                 preselect_role: str | None = None):
+        super().__init__(timeout=86400)
+        self.match_id = match_id
+        self.db = db
+        self.signups = signups
+        self.selected_role = preselect_role
+        self.selected_user = None
+        self.add_item(_ReplaceRoleSelect(preselect_role))
+        self.add_item(_ReplaceCandidateSelect(signups, db))
+        self.add_item(_ReplaceApplyButton())
+        self.add_item(_ReplaceDoneButton())
