@@ -345,6 +345,11 @@ class _NewMatchSelect(discord.ui.Select):
             except Exception as e:
                 log.warning("New Match: failed to delete event %s: %s", old_event_id, e)
         if old_event_id:
+            from cogs.confirm_view import cancel_orphaned_confirmation
+            await cancel_orphaned_confirmation(
+                interaction.client, db, self.current_match_id,
+                reason="this match was swapped out for a new match",
+            )
             db.update_match_teamup_id(self.current_match_id, None)
             db.decrement_scheduled_count(current_match["team_home"])
             db.decrement_scheduled_count(current_match["team_away"])
@@ -563,6 +568,7 @@ class BlockDayButton(discord.ui.Button):
         day_matches = db.get_matches_for_date(date_str)
         day_match_ids = {m["id"] for m in day_matches}
 
+        from cogs.confirm_view import cancel_orphaned_confirmation
         for m in day_matches:
             eid = m.get("teamup_event_id")
             if eid and teamup:
@@ -571,6 +577,10 @@ class BlockDayButton(discord.ui.Button):
                 except Exception as e:
                     log.warning("Block: failed to remove event %s: %s", eid, e)
             if eid:
+                await cancel_orphaned_confirmation(
+                    interaction.client, db, m["id"],
+                    reason="this day was blocked",
+                )
                 db.update_match_teamup_id(m["id"], None)
                 db.decrement_scheduled_count(m["team_home"])
                 db.decrement_scheduled_count(m["team_away"])

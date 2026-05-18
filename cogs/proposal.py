@@ -128,6 +128,7 @@ class _DeleteButton(discord.ui.Button):
         await interaction.response.defer()
         teamup = interaction.client.get_teamup()
         old_ids: list[str] = json.loads(change.get("old_event_ids") or "[]")
+        from cogs.confirm_view import cancel_orphaned_confirmation
         for event_id in old_ids:
             if teamup:
                 try:
@@ -135,6 +136,10 @@ class _DeleteButton(discord.ui.Button):
                 except Exception as e:
                     log.warning("Delete: failed to remove event %s: %s", event_id, e)
             for m in db.get_matches_by_teamup_event_id(event_id):
+                await cancel_orphaned_confirmation(
+                    interaction.client, db, m["id"],
+                    reason="this proposal was deleted",
+                )
                 db.update_match_teamup_id(m["id"], None)
                 db.decrement_scheduled_count(m["team_home"])
                 db.decrement_scheduled_count(m["team_away"])
@@ -197,6 +202,7 @@ class _BlockDayButton(discord.ui.Button):
             return
 
         # Delete all events for the day
+        from cogs.confirm_view import cancel_orphaned_confirmation
         for m in db.get_matches_for_date(date_str):
             eid = m.get("teamup_event_id")
             if eid and teamup:
@@ -205,6 +211,10 @@ class _BlockDayButton(discord.ui.Button):
                 except Exception as e:
                     log.warning("Block: failed to remove event %s: %s", eid, e)
             if eid:
+                await cancel_orphaned_confirmation(
+                    interaction.client, db, m["id"],
+                    reason="this day was blocked",
+                )
                 db.update_match_teamup_id(m["id"], None)
                 db.decrement_scheduled_count(m["team_home"])
                 db.decrement_scheduled_count(m["team_away"])

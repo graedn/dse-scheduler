@@ -361,7 +361,7 @@ class _UpdateScheduleButton(discord.ui.Button):
                   if mid and mid not in set(old_slot_ids)]
 
         for mid in to_remove:
-            await _unschedule_match(mid, db, teamup, signup_ch)
+            await _unschedule_match(mid, db, teamup, signup_ch, bot=interaction.client)
 
         talent_role_id = db.get_config("talent_role_id")
         talent_role_mention = f"<@&{talent_role_id}>" if talent_role_id else ""
@@ -443,7 +443,7 @@ class _ClearSelectionsButton(discord.ui.Button):
                             affected_signups.append(s["user_id"])
 
         for mid in old_slot_ids:
-            await _unschedule_match(mid, db, teamup, signup_ch)
+            await _unschedule_match(mid, db, teamup, signup_ch, bot=interaction.client)
 
         # Remove block if day was blocked
         blocked = db.get_blocked_day(self.date_str)
@@ -521,6 +521,7 @@ class _BlockDayButton(discord.ui.Button):
 
         # Unschedule all matches for the day
         all_matches = db.get_matches_for_date(self.date_str)
+        from cogs.confirm_view import cancel_orphaned_confirmation
         for m in all_matches:
             eid = m.get("teamup_event_id")
             if eid and teamup:
@@ -529,6 +530,10 @@ class _BlockDayButton(discord.ui.Button):
                 except Exception as e:
                     log.warning("Block: failed to delete event %s: %s", eid, e)
             if eid:
+                await cancel_orphaned_confirmation(
+                    interaction.client, db, m["id"],
+                    reason="this day was blocked",
+                )
                 db.update_match_teamup_id(m["id"], None)
                 db.decrement_scheduled_count(m["team_home"])
                 db.decrement_scheduled_count(m["team_away"])
@@ -586,8 +591,11 @@ class _BlockDayButton(discord.ui.Button):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-async def _unschedule_match(match_id: int, db, teamup, signup_ch) -> None:
-    """Delete a match's TeamUp event, reset DB state, and edit the sign-up message."""
+async def _unschedule_match(match_id: int, db, teamup, signup_ch, bot=None) -> None:
+    """Delete a match's TeamUp event, reset DB state, and edit the sign-up message.
+
+    When `bot` is provided, also clears any active talent confirmation message
+    for this match (must run before reset_allocation wipes the message ID)."""
     m = db.get_match(match_id)
     if not m:
         return
@@ -598,6 +606,9 @@ async def _unschedule_match(match_id: int, db, teamup, signup_ch) -> None:
         except Exception as e:
             log.warning("Unschedule match %s: failed to delete event %s: %s", match_id, eid, e)
     if eid:
+        if bot is not None:
+            from cogs.confirm_view import cancel_orphaned_confirmation
+            await cancel_orphaned_confirmation(bot, db, match_id)
         db.update_match_teamup_id(match_id, None)
         db.decrement_scheduled_count(m["team_home"])
         db.decrement_scheduled_count(m["team_away"])

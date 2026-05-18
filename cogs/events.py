@@ -306,6 +306,11 @@ class EventsCog(commands.Cog):
         else:
             status_note = "Updated in Logged Matches."
 
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        await cancel_orphaned_confirmation(
+            self.bot, db, old_mid,
+            reason="this match was rescheduled to a new time",
+        )
         db.clear_match_from_proposal_slots(old_mid)
         db.delete_match_cascade(old_mid)
         db.insert_match(

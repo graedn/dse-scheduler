@@ -266,7 +266,12 @@ class _InitiateSignUpButton(discord.ui.Button):
             except Exception as e:
                 log.warning("_InitiateSignUpButton: failed to edit old sign-up message: %s", e)
 
-        # Reset allocation
+        # Reset allocation (also cancels any orphaned confirmation message)
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        await cancel_orphaned_confirmation(
+            interaction.client, db, match_id,
+            reason="this match was rescheduled and a new sign-up is being collected",
+        )
         db.reset_allocation(match_id)
 
         # Send update notification before posting new sign-up
@@ -368,7 +373,12 @@ class _CancelBroadcastButton(discord.ui.Button):
         all_user_ids = list({s["user_id"] for s in signups
                              if s["role"] != "unavailable"})
 
-        # Reset allocation and mark match cancelled
+        # Reset allocation and mark match cancelled (also cancels any orphaned confirmation message)
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        await cancel_orphaned_confirmation(
+            interaction.client, db, match_id,
+            reason="the broadcast was cancelled",
+        )
         db.reset_allocation(match_id)
         db.set_allocation_status(match_id, "cancelled")
 
