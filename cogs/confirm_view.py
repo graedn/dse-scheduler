@@ -16,6 +16,7 @@ _DISPLAY_ORDER = [
 ]
 
 _DISPLAY_LABEL = {k: lbl for k, lbl, _ in _DISPLAY_ORDER}
+_REQUIRED_KEYS = {k for k, _lbl, req in _DISPLAY_ORDER if req}
 
 
 async def cancel_orphaned_confirmation(bot, db, match_id: int,
@@ -329,7 +330,7 @@ class RejectButton(discord.ui.Button):
         manager_role_id = db.get_config("manager_role_id")
         mgr = f"<@&{manager_role_id}> " if manager_role_id else ""
         label = _DISPLAY_LABEL.get(rejected_key, rejected_key or "role")
-        required = rejected_key in ("producer", "observer", "pbp_1", "colour_1")
+        required = rejected_key in _REQUIRED_KEYS
 
         if not log_ch:
             return
