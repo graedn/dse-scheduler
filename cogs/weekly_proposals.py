@@ -369,6 +369,7 @@ class _UpdateScheduleButton(discord.ui.Button):
             new_m = db.get_match(new_mid)
             if not new_m:
                 continue
+            # to_add can't hold two same-time matches (slot1 != slot2 + >= PAIR_MIN_H gap enforced above), so no double-pair
             twin = next(
                 (rm for rm in to_remove
                  if (db.get_match(rm) or {}).get("match_time") == new_m["match_time"]),
@@ -382,6 +383,7 @@ class _UpdateScheduleButton(discord.ui.Button):
                 except Exception as e:
                     log.error("Update Schedule: accept_combination failed for %s: %s",
                               new_mid, e)
+                    # carry aborted: twin still in to_remove (unscheduled below) and new_mid not in carried_new_ids, so it falls through to the fresh-post loop
                     continue
                 await carry_over_if_same_time(interaction.client, db, twin, new_mid)
                 carried_new_ids.add(new_mid)

@@ -382,6 +382,53 @@ async def test_proposal_swap_same_time_carries_signups(db, monkeypatch):
     assert called_match_ids == {new}
 
 
+async def test_proposal_swap_different_time_uses_fresh_path(db, monkeypatch):
+    """Swapping the slot-1 match for a match at a DIFFERENT match_time does NOT
+    carry the old match's sign-ups. The new match goes through the regular
+    fresh accept_combination loop, and the old match is still unscheduled."""
+    from cogs import weekly_proposals
+
+    # `new` is 3 hours after `old` (MATCH_TS2 = 10pm vs MATCH_TS = 7pm), well
+    # above any pair-gap threshold and crucially a *different* match_time.
+    old = db.insert_match("Premier", "1", "Alpha", "Beta", MATCH_TS, MATCH_TS - 3600)
+    new = db.insert_match("Premier", "1", "Gamma", "Delta", MATCH_TS2, MATCH_TS2 - 3600)
+    db.update_match_teamup_id(old, "evtOLD")
+
+    db.create_proposal_message(DATE_STR, DATE_TS, "2099-06-09")
+    db.update_proposal_slots(DATE_STR, old, None)
+    db.upsert_signup(old, "m", "producer", "u1", "user1", "U1")
+
+    # Patch the heavy collaborators so the test isolates the swap wiring.
+    acc = AsyncMock()
+    unsched = AsyncMock()
+    monkeypatch.setattr(weekly_proposals, "accept_combination", acc)
+    monkeypatch.setattr(weekly_proposals, "_unschedule_match", unsched)
+
+    interaction = _update_interaction(db)
+    # Manager selects `new` in slot 1, slot 2 stays empty (same mechanism the
+    # callback reads: interaction.client._proposal_selections keyed by
+    # (date_str, slot); see _UpdateScheduleButton.callback).
+    interaction.client._proposal_selections = {
+        (DATE_STR, 1): str(new),
+        (DATE_STR, 2): "none",
+    }
+
+    button = weekly_proposals._UpdateScheduleButton(DATE_STR)
+    await button.callback(interaction)
+
+    # Different time → no carry-over: the new match has NO sign-ups.
+    assert db.get_signups_for_match(new) == []
+    # The old match was still unscheduled.
+    assert old in {c.args[0] for c in unsched.call_args_list}
+    # The fresh accept_combination path ran for `new` (it was NOT skipped via
+    # the carry-over branch) — `new` is among the match ids passed to
+    # accept_combination.
+    fresh_called_ids = set()
+    for call in acc.call_args_list:
+        fresh_called_ids.update(m["id"] for m in call.args[0])
+    assert new in fresh_called_ids
+
+
 # ---------------------------------------------------------------------------
 # _send_schedule_update_ping
 # ---------------------------------------------------------------------------
