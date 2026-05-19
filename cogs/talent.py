@@ -791,9 +791,10 @@ async def carry_over_if_same_time(bot, db, old_match_id: int,
                 log.warning("carry_over: notice failed for match %s: %s",
                             new_match_id, e)
 
-        # An accepted broadcast must stay on the Accepted sub-calendar with the
-        # new teams. The replacement's event was created on "proposed" by
-        # accept_combination — move/retitle it to match the finalized state.
+        # An accepted broadcast must stay on the Accepted sub-calendar with
+        # the new teams. The replacement's event may be a fresh "proposed"
+        # event (accept_combination) or the transferred original event
+        # (match-post-edit swap); retitle/move it to the finalized state.
         if status == "accepted":
             teamup = bot.get_teamup()
             fresh_new = db.get_match(new_match_id) or new
