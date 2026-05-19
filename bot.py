@@ -239,6 +239,15 @@ async def on_ready():
         scheduler.start()
         print("Scheduler started.")
 
+    # Catch-up: if the bot was offline at the Sunday 23:00 ET transition,
+    # APScheduler does not run the missed cron job — recreate this week's
+    # proposal messages now if they're absent.
+    try:
+        from cogs.weekly_proposals import recover_missed_weekly_proposals
+        await recover_missed_weekly_proposals(bot, db)
+    except Exception as e:
+        log.error("[weekly_proposals] startup recovery failed: %s", e)
+
 
 async def main():
     token = os.getenv("DISCORD_BOT_TOKEN")
