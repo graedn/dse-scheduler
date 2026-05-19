@@ -7,6 +7,7 @@ matches to broadcast slots and confirm with the Update Schedule button.
 import discord
 import logging
 from datetime import datetime, timedelta
+from typing import Optional
 from zoneinfo import ZoneInfo
 from discord.ext import commands
 
@@ -236,6 +237,29 @@ async def create_weekly_proposals(bot, db, start_date=None) -> None:
             log.error("Failed to post proposal message for %s: %s", date_str, e)
 
 
+async def recover_missed_weekly_proposals(bot, db) -> None:
+    """Startup catch-up for a missed Sunday 23:00 ET creation.
+
+    APScheduler does not run a cron job whose fire time elapsed while the
+    process was down, so if the bot was offline at the Sunday transition the
+    current week's proposal messages are never created. When no proposal rows
+    exist for the current week, create them now (today through this Sunday).
+    Idempotent: a no-op when the week's proposals already exist (normal
+    restart) and it never pre-empts the still-scheduled Sunday job that
+    creates the *next* week.
+    """
+    today = datetime.now(tz=ET).date()
+    monday = today - timedelta(days=today.weekday())
+    week_start = monday.isoformat()
+    if db.get_proposal_messages_for_week(week_start):
+        return  # week already has proposals — nothing was missed
+    log.info(
+        "Weekly proposals missing for week %s — running startup recovery.",
+        week_start,
+    )
+    await create_weekly_proposals(bot, db, start_date=today)
+
+
 async def mark_passed_proposals(db, bot) -> None:
     """Mark proposals whose dates have passed, and remove their buttons."""
     today = datetime.now(tz=ET).date()
@@ -345,6 +369,8 @@ class _UpdateScheduleButton(discord.ui.Button):
                 if mid:
                     old_slot_ids.append(mid)
                     for s in db.get_signups_for_match(mid):
+                        if s["role"] == "unavailable":
+                            continue
                         if s["user_id"] not in affected_signups:
                             affected_signups.append(s["user_id"])
 
@@ -357,12 +383,42 @@ class _UpdateScheduleButton(discord.ui.Button):
         to_add = [mid for mid in [slot1_id, slot2_id]
                   if mid and mid not in set(old_slot_ids)]
 
+        from cogs.talent import carry_over_if_same_time
+
+        # Pair each added match with a removed match at the same time (if any)
+        # so state carries over instead of a fresh sign-up.
+        carried_new_ids: set[int] = set()
+        for new_mid in list(to_add):
+            new_m = db.get_match(new_mid)
+            if not new_m:
+                continue
+            # to_add can't hold two same-time matches (slot1 != slot2 + >= PAIR_MIN_H gap enforced above), so no double-pair
+            twin = next(
+                (rm for rm in to_remove
+                 if (db.get_match(rm) or {}).get("match_time") == new_m["match_time"]),
+                None,
+            )
+            if twin is not None:
+                try:
+                    await accept_combination(
+                        [new_m], self.date_str, db, teamup, signup_ch,
+                        talent_role_mention="")
+                except Exception as e:
+                    log.error("Update Schedule: accept_combination failed for %s: %s",
+                              new_mid, e)
+                    # carry aborted: twin still in to_remove (unscheduled below) and new_mid not in carried_new_ids, so it falls through to the fresh-post loop
+                    continue
+                await carry_over_if_same_time(interaction.client, db, twin, new_mid)
+                carried_new_ids.add(new_mid)
+
         for mid in to_remove:
-            await _unschedule_match(mid, db, teamup, signup_ch)
+            await _unschedule_match(mid, db, teamup, signup_ch, bot=interaction.client)
 
         talent_role_id = db.get_config("talent_role_id")
         talent_role_mention = f"<@&{talent_role_id}>" if talent_role_id else ""
         for mid in to_add:
+            if mid in carried_new_ids:
+                continue
             m = db.get_match(mid)
             if not m:
                 continue
@@ -374,10 +430,18 @@ class _UpdateScheduleButton(discord.ui.Button):
 
         db.update_proposal_slots(self.date_str, slot1_id, slot2_id)
 
+        update_msg = None
         if affected_signups and to_remove:
-            await _send_schedule_update_ping(
+            update_msg = await _send_schedule_update_ping(
                 self.date_str, affected_signups, interaction.client, db,
                 "The broadcast schedule for this day has been changed.",
+            )
+
+        # When a sign-up was replaced (both removed AND added), append a link
+        # to the schedule update message on each new sign-up post.
+        if update_msg and to_add and signup_ch:
+            await _link_schedule_update_to_signups(
+                to_add, update_msg, signup_ch, db
             )
 
         all_matches = db.get_matches_for_date(self.date_str)
@@ -426,11 +490,13 @@ class _ClearSelectionsButton(discord.ui.Button):
                 if mid:
                     old_slot_ids.append(mid)
                     for s in db.get_signups_for_match(mid):
+                        if s["role"] == "unavailable":
+                            continue
                         if s["user_id"] not in affected_signups:
                             affected_signups.append(s["user_id"])
 
         for mid in old_slot_ids:
-            await _unschedule_match(mid, db, teamup, signup_ch)
+            await _unschedule_match(mid, db, teamup, signup_ch, bot=interaction.client)
 
         # Remove block if day was blocked
         blocked = db.get_blocked_day(self.date_str)
@@ -501,11 +567,14 @@ class _BlockDayButton(discord.ui.Button):
                 mid = proposal.get(slot_key)
                 if mid:
                     for s in db.get_signups_for_match(mid):
+                        if s["role"] == "unavailable":
+                            continue
                         if s["user_id"] not in affected_signups:
                             affected_signups.append(s["user_id"])
 
         # Unschedule all matches for the day
         all_matches = db.get_matches_for_date(self.date_str)
+        from cogs.confirm_view import cancel_orphaned_confirmation
         for m in all_matches:
             eid = m.get("teamup_event_id")
             if eid and teamup:
@@ -514,6 +583,10 @@ class _BlockDayButton(discord.ui.Button):
                 except Exception as e:
                     log.warning("Block: failed to delete event %s: %s", eid, e)
             if eid:
+                await cancel_orphaned_confirmation(
+                    interaction.client, db, m["id"],
+                    reason="this day was blocked",
+                )
                 db.update_match_teamup_id(m["id"], None)
                 db.decrement_scheduled_count(m["team_home"])
                 db.decrement_scheduled_count(m["team_away"])
@@ -571,8 +644,11 @@ class _BlockDayButton(discord.ui.Button):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-async def _unschedule_match(match_id: int, db, teamup, signup_ch) -> None:
-    """Delete a match's TeamUp event, reset DB state, and edit the sign-up message."""
+async def _unschedule_match(match_id: int, db, teamup, signup_ch, bot=None) -> None:
+    """Delete a match's TeamUp event, reset DB state, and edit the sign-up message.
+
+    When `bot` is provided, also clears any active talent confirmation message
+    for this match (must run before reset_allocation wipes the message ID)."""
     m = db.get_match(match_id)
     if not m:
         return
@@ -583,6 +659,9 @@ async def _unschedule_match(match_id: int, db, teamup, signup_ch) -> None:
         except Exception as e:
             log.warning("Unschedule match %s: failed to delete event %s: %s", match_id, eid, e)
     if eid:
+        if bot is not None:
+            from cogs.confirm_view import cancel_orphaned_confirmation
+            await cancel_orphaned_confirmation(bot, db, match_id)
         db.update_match_teamup_id(match_id, None)
         db.decrement_scheduled_count(m["team_home"])
         db.decrement_scheduled_count(m["team_away"])
@@ -609,21 +688,42 @@ async def _unschedule_match(match_id: int, db, teamup, signup_ch) -> None:
 async def _send_schedule_update_ping(
     date_str: str, user_ids: list[str], client, db,
     reason: str, prefix: str = "📋 **Schedule Update**"
-) -> None:
-    """Send a mention ping to the schedule-updates channel."""
+) -> Optional[discord.Message]:
+    """Send a mention ping to the schedule-updates channel.
+
+    Returns the sent message (so callers can link to it), or None if the
+    channel isn't configured/reachable or the send failed."""
     updates_ch_id = db.get_config("schedule_updates_channel_id")
     if not updates_ch_id:
-        return
+        return None
     updates_ch = client.get_channel(int(updates_ch_id))
     if not updates_ch:
-        return
+        return None
     mentions = " ".join(f"<@{uid}>" for uid in user_ids)
     try:
-        await updates_ch.send(
+        return await updates_ch.send(
             f"{prefix} — {_fmt_date(date_str)}\n{reason}\n{mentions}"
         )
     except Exception as e:
         log.warning("Failed to send schedule-updates ping for %s: %s", date_str, e)
+        return None
+
+
+async def _link_schedule_update_to_signups(
+    new_match_ids: list[int], update_msg: discord.Message,
+    signup_ch, db,
+) -> None:
+    """Append a 'View schedule update' link to each new sign-up message."""
+    link_line = f"\n\n🔗 [View schedule update]({update_msg.jump_url})"
+    for mid in new_match_ids:
+        bcast = db.get_broadcast_message(mid)
+        if not bcast:
+            continue
+        try:
+            msg = await signup_ch.fetch_message(int(bcast["discord_message_id"]))
+            await msg.edit(content=msg.content + link_line)
+        except Exception as e:
+            log.warning("Failed to link schedule update on sign-up %s: %s", mid, e)
 
 
 class _UnblockDayButton(discord.ui.Button):

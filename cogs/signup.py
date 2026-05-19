@@ -25,7 +25,12 @@ def _manager_check(interaction: discord.Interaction, db) -> bool:
         return False
     if interaction.user.guild_permissions.administrator:
         return True
-    return db.is_manager(str(interaction.user.id))
+    if db.is_manager(str(interaction.user.id)):
+        return True
+    role_id = db.get_config("manager_role_id")
+    if role_id:
+        return any(str(r.id) == role_id for r in interaction.user.roles)
+    return False
 
 
 def _get_effective_signup_ch(db, bot):
@@ -171,10 +176,6 @@ class UnavailableButton(discord.ui.Button):
         signups = db.get_signups_for_match(self.match_id)
         user_signups = [s for s in signups if s["user_id"] == user_id]
         already_unavailable = any(s["role"] == "unavailable" for s in user_signups)
-
-        # First interaction with this match → count as a response
-        if not user_signups:
-            db.increment_talent_response(user_id, username, display_name)
 
         # Remove all existing signups for this user (roles + unavailable)
         db.remove_all_signups_for_user(self.match_id, user_id)
@@ -336,6 +337,14 @@ class _NewMatchSelect(discord.ui.Select):
                                 seen.add(uid)
                                 allocated_talent.append(assignment)
 
+        # Same-time swap → carry silently, do NOT cancel or re-ping talent.
+        if current_match["match_time"] == selected_match["match_time"]:
+            await self._carry_same_time_swap(
+                interaction, db, teamup, current_match, selected_match,
+                selected_match_id, was_accepted,
+            )
+            return
+
         # Remove current match from calendar
         old_event_id = current_match.get("teamup_event_id")
         if teamup and old_event_id:
@@ -344,6 +353,11 @@ class _NewMatchSelect(discord.ui.Select):
             except Exception as e:
                 log.warning("New Match: failed to delete event %s: %s", old_event_id, e)
         if old_event_id:
+            from cogs.confirm_view import cancel_orphaned_confirmation
+            await cancel_orphaned_confirmation(
+                interaction.client, db, self.current_match_id,
+                reason="this match was swapped out for a new match",
+            )
             db.update_match_teamup_id(self.current_match_id, None)
             db.decrement_scheduled_count(current_match["team_home"])
             db.decrement_scheduled_count(current_match["team_away"])
@@ -444,6 +458,104 @@ class _NewMatchSelect(discord.ui.Select):
                 f"✅ **[{selected_match['division']}] "
                 f"{selected_match['team_home']} vs {selected_match['team_away']}** "
                 f"added to the broadcast schedule."
+            ),
+            view=None,
+        )
+
+    async def _carry_same_time_swap(self, interaction, db, teamup,
+                                    current_match, selected_match,
+                                    selected_match_id, was_accepted) -> None:
+        """Replacement shares the current match's time slot: carry sign-ups,
+        allocation and confirmations over, keep the broadcast APPROVED, and do
+        NOT re-ping talent (carry_over_if_same_time edits the existing
+        confirmation message in place and posts the single notice)."""
+        signup_ch = _get_effective_signup_ch(db, interaction.client)
+        date_str = datetime.fromtimestamp(
+            selected_match["match_time"], tz=ET
+        ).strftime("%Y-%m-%d")
+        old_event_id = current_match.get("teamup_event_id")
+
+        from scheduler import accept_combination
+        try:
+            await accept_combination(
+                [selected_match], date_str, db, teamup, signup_ch)
+        except Exception as e:
+            log.error("New Match: accept_combination failed for match %s: %s",
+                      selected_match_id, e)
+            await interaction.response.edit_message(
+                content=f"❌ Failed to schedule replacement: `{e}`", view=None
+            )
+            return
+
+        try:
+            from cogs.talent import carry_over_if_same_time
+            await carry_over_if_same_time(
+                interaction.client, db, self.current_match_id, selected_match_id)
+        except Exception as e:
+            log.warning("New Match: carry-over failed (%s → %s): %s",
+                        self.current_match_id, selected_match_id, e)
+
+        if was_accepted:
+            db.mark_broadcast_accepted(selected_match_id)
+            try:
+                from scheduler import build_approved_signup_message
+                fresh_sel = db.get_match(selected_match_id)
+                sel_alloc = db.get_allocation(selected_match_id)
+                ra = (json.loads(sel_alloc["role_assignments"])
+                      if sel_alloc and sel_alloc.get("role_assignments") else {})
+                sel_bm = db.get_broadcast_message(selected_match_id)
+                if sel_bm and signup_ch:
+                    sel_msg = await signup_ch.fetch_message(
+                        int(sel_bm["discord_message_id"]))
+                    await sel_msg.edit(
+                        content=build_approved_signup_message(fresh_sel, ra),
+                        view=ApprovedSignUpView(selected_match_id),
+                    )
+            except Exception as e:
+                log.warning("New Match: failed to set replacement sign-up "
+                            "to APPROVED: %s", e)
+
+        # Retire the OLD match without cancelling or re-pinging anyone.
+        if teamup and old_event_id:
+            try:
+                teamup.delete_event(old_event_id)
+            except Exception as e:
+                log.warning("New Match: failed to delete event %s: %s",
+                            old_event_id, e)
+        if old_event_id:
+            db.update_match_teamup_id(self.current_match_id, None)
+            db.decrement_scheduled_count(current_match["team_home"])
+            db.decrement_scheduled_count(current_match["team_away"])
+        db.reset_allocation(self.current_match_id)
+        if was_accepted:
+            db.clear_broadcast_accepted(self.current_match_id)
+
+        old_bm = db.get_broadcast_message(self.current_match_id)
+        if old_bm and signup_ch:
+            try:
+                old_msg = await signup_ch.fetch_message(
+                    int(old_bm["discord_message_id"]))
+                ts = current_match["match_time"]
+                await old_msg.edit(
+                    content=(
+                        f"{_SEPARATOR}\n"
+                        f"📋 [{current_match['division']}] "
+                        f"{current_match['team_home']} vs {current_match['team_away']}\n"
+                        f"<t:{ts}:F>\n\n"
+                        f"♻️ This broadcast now covers a different match at the "
+                        f"same time — see the updated post."
+                    ),
+                    view=discord.ui.View(),
+                )
+            except Exception as e:
+                log.warning("New Match: failed to edit old sign-up message: %s", e)
+
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **[{selected_match['division']}] "
+                f"{selected_match['team_home']} vs {selected_match['team_away']}** "
+                f"carried over to the broadcast schedule "
+                f"(same time — talent not re-pinged)."
             ),
             view=None,
         )
@@ -562,6 +674,7 @@ class BlockDayButton(discord.ui.Button):
         day_matches = db.get_matches_for_date(date_str)
         day_match_ids = {m["id"] for m in day_matches}
 
+        from cogs.confirm_view import cancel_orphaned_confirmation
         for m in day_matches:
             eid = m.get("teamup_event_id")
             if eid and teamup:
@@ -570,6 +683,10 @@ class BlockDayButton(discord.ui.Button):
                 except Exception as e:
                     log.warning("Block: failed to remove event %s: %s", eid, e)
             if eid:
+                await cancel_orphaned_confirmation(
+                    interaction.client, db, m["id"],
+                    reason="this day was blocked",
+                )
                 db.update_match_teamup_id(m["id"], None)
                 db.decrement_scheduled_count(m["team_home"])
                 db.decrement_scheduled_count(m["team_away"])
@@ -660,12 +777,59 @@ class SignUpView(discord.ui.View):
         self.add_item(BlockDayButton(match_id))
 
 
+class EditAllocationButton(discord.ui.Button):
+    def __init__(self, match_id: int):
+        self.match_id = match_id
+        super().__init__(
+            label="Edit Allocation",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"edit_alloc_{match_id}",
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("Must be used in a server.", ephemeral=True)
+            return
+
+        db = interaction.client.db
+        if not _manager_check(interaction, db):
+            await interaction.response.send_message(
+                "Only managers and administrators can use this button.", ephemeral=True
+            )
+            return
+        match = db.get_match(self.match_id)
+        if not match:
+            await interaction.response.send_message(
+                "Match not found.", ephemeral=True)
+            return
+        log_ch_id = db.get_config("log_channel_id")
+        log_ch = interaction.client.get_channel(int(log_ch_id)) if log_ch_id else None
+        if not log_ch:
+            await interaction.response.send_message(
+                "Log channel not configured.", ephemeral=True)
+            return
+        from cogs.talent import ReplaceRoleView
+        avail = [s for s in db.get_signups_for_match(self.match_id)
+                 if s["role"] != "unavailable"]
+        await log_ch.send(
+            f"✏️ **Editing allocation** — **[{match['division']}] "
+            f"{match['team_home']} vs {match['team_away']}** | "
+            f"<t:{match['match_time']}:F>\n"
+            f"Pick a role and a replacement. Only the changed person is pinged.",
+            view=ReplaceRoleView(self.match_id, db, avail),
+        )
+        await interaction.response.send_message(
+            "Allocation editor posted in the log channel.", ephemeral=True)
+
+
 class ApprovedSignUpView(discord.ui.View):
     """Persistent view shown on sign-up messages after talent confirmation is complete.
-    Only New Match, Block Day, and Create Thread remain active."""
+    Only New Match, Block Day, Create Thread, and Edit Allocation remain active."""
     def __init__(self, match_id: int):
         from cogs.threads import CreateThreadButton
         super().__init__(timeout=None)
         self.add_item(NewMatchButton(match_id))
         self.add_item(BlockDayButton(match_id))
         self.add_item(CreateThreadButton(match_id))
+        self.add_item(EditAllocationButton(match_id))

@@ -15,6 +15,38 @@ _DISPLAY_ORDER = [
     ("analyst_1", "Analyst",       False),
 ]
 
+_DISPLAY_LABEL = {k: lbl for k, lbl, _ in _DISPLAY_ORDER}
+_REQUIRED_KEYS = {k for k, _lbl, req in _DISPLAY_ORDER if req}
+
+
+async def cancel_orphaned_confirmation(bot, db, match_id: int,
+                                        reason: str | None = None) -> None:
+    """Edit any active talent confirmation message for a match to a cancelled
+    state and remove its buttons.
+
+    MUST be called BEFORE reset_allocation / delete_match_cascade so the
+    confirmation_message_id is still readable. No-op when no confirmation
+    message is associated with the match."""
+    alloc = db.get_allocation(match_id)
+    if not alloc:
+        return
+    msg_id = alloc.get("confirmation_message_id")
+    ch_id = alloc.get("confirmation_channel_id")
+    if not msg_id or not ch_id:
+        return
+    channel = bot.get_channel(int(ch_id))
+    if not channel:
+        return
+    note = reason or "this broadcast was removed from the schedule"
+    try:
+        msg = await channel.fetch_message(int(msg_id))
+        await msg.edit(
+            content=msg.content + f"\n\n⏏️ **Talent confirmation cancelled** — {note}.",
+            view=discord.ui.View(),
+        )
+    except Exception as e:
+        log.warning("cancel_orphaned_confirmation: failed for match %s: %s", match_id, e)
+
 
 def build_confirmation_message(match: dict, role_assignments: dict,
                                 confirmations: dict) -> str:
@@ -29,6 +61,14 @@ def build_confirmation_message(match: dict, role_assignments: dict,
         "",
     ]
 
+    def _tag(uid):
+        status = confirmations.get(uid)
+        if status is True:
+            return "[Ready]"
+        if status is False:
+            return "[Rejected]"
+        return "[No Response]"
+
     for key, label, required in _DISPLAY_ORDER:
         assignment = role_assignments.get(key)
         if not assignment:
@@ -36,23 +76,14 @@ def build_confirmation_message(match: dict, role_assignments: dict,
         uid = assignment["user_id"]
         name = assignment["display_name"]
         if required:
-            status = confirmations.get(uid)
-            if status is True:
-                tag = "[Ready]"
-            elif status is False:
-                tag = "[Rejected]"
-            else:
-                tag = "[No Response]"
-            lines.append(f"**{label}:** <@{uid}> — {name} {tag}")
+            lines.append(f"**{label}:** <@{uid}> — {name} {_tag(uid)}")
         else:
-            lines.append(f"**{label}** (optional): <@{uid}> — {name}")
+            lines.append(f"**{label}** (optional): <@{uid}> — {name} {_tag(uid)}")
 
-    # Awaiting mentions (only required users who haven't responded)
+    # Awaiting mentions: any assigned user (required or optional) still pending
     awaiting = []
     seen_awaiting: set[str] = set()
-    for key, _label, required in _DISPLAY_ORDER:
-        if not required:
-            continue
+    for key, _label, _required in _DISPLAY_ORDER:
         a = role_assignments.get(key)
         if a:
             uid = a["user_id"]
@@ -164,6 +195,22 @@ async def _finalize_match(match: dict, alloc: dict, role_assignments: dict, bot)
             )
 
 
+async def _stale_message_cleanup(interaction: discord.Interaction) -> None:
+    """Edit a stale confirmation message in place (no buttons) so the next
+    talent member who looks at it sees that it's been cancelled instead of
+    clicking and getting a 'no longer active' ephemeral."""
+    suffix = "\n\n⏏️ **Talent confirmation cancelled** — this broadcast is no longer scheduled."
+    if suffix.strip() in (interaction.message.content or ""):
+        return
+    try:
+        await interaction.message.edit(
+            content=(interaction.message.content or "") + suffix,
+            view=discord.ui.View(),
+        )
+    except Exception as e:
+        log.warning("Failed to clean up stale confirmation message: %s", e)
+
+
 class ReadyButton(discord.ui.Button):
     def __init__(self, match_id: int):
         self.match_id = match_id
@@ -181,6 +228,7 @@ class ReadyButton(discord.ui.Button):
             await interaction.response.send_message(
                 "This confirmation is no longer active.", ephemeral=True
             )
+            await _stale_message_cleanup(interaction)
             return
 
         user_id = str(interaction.user.id)
@@ -198,7 +246,9 @@ class ReadyButton(discord.ui.Button):
 
         new_content = build_confirmation_message(match, role_assignments, fresh_conf)
 
-        if all(v is True for v in fresh_conf.values()):
+        from cogs.talent import _get_required_user_ids
+        required_ids = _get_required_user_ids(role_assignments)
+        if required_ids and all(fresh_conf.get(uid) is True for uid in required_ids):
             await interaction.response.edit_message(
                 content=new_content + "\n\n✅ **All talent confirmed — moved to Accepted Calendar!**",
                 view=discord.ui.View(),
@@ -225,6 +275,7 @@ class RejectButton(discord.ui.Button):
             await interaction.response.send_message(
                 "This confirmation is no longer active.", ephemeral=True
             )
+            await _stale_message_cleanup(interaction)
             return
 
         user_id = str(interaction.user.id)
@@ -236,40 +287,73 @@ class RejectButton(discord.ui.Button):
             return
 
         db.set_confirmation(alloc["match_id"], user_id, False)
-        db.reset_allocation(alloc["match_id"])
 
-        match = db.get_match(alloc["match_id"])
+        match_id = alloc["match_id"]
+        match = db.get_match(match_id)
         role_assignments = json.loads(alloc.get("role_assignments") or "{}")
-        decliner = next(
-            (a for a in role_assignments.values()
+
+        # Which role did this user hold?
+        rejected_key = next(
+            (k for k, a in role_assignments.items()
              if isinstance(a, dict) and a.get("user_id") == user_id),
             None,
         )
+        decliner = role_assignments.get(rejected_key) if rejected_key else None
         name = decliner["display_name"] if decliner else f"<@{user_id}>"
 
+        fresh_conf = db.get_confirmations(match_id)
+        rejected_content = build_confirmation_message(
+            match, role_assignments, fresh_conf)
+
+        # Mark the decliner Unavailable so they drop out of candidate lists.
+        if decliner:
+            bcast = db.get_broadcast_message(match_id)
+            signup_message_id = str(bcast["discord_message_id"]) if bcast else ""
+            db.remove_all_signups_for_user(match_id, user_id)
+            db.upsert_signup(
+                match_id=match_id, message_id=signup_message_id,
+                role="unavailable", user_id=user_id,
+                username=decliner["username"],
+                display_name=decliner["display_name"],
+            )
+            db.increment_talent_unavailable(
+                user_id, decliner["username"], decliner["display_name"])
+
+        # Re-render the confirmation message in place ([Rejected] shows). The
+        # ConfirmationView buttons stay live for everyone else.
         await interaction.response.edit_message(
-            content=interaction.message.content
-                    + f"\n\n❌ **{name}** rejected — re-opening allocation.",
-            view=discord.ui.View(),
-        )
+            content=rejected_content, view=self.view)
 
         log_ch_id = db.get_config("log_channel_id")
-        broadcast_ch_id = db.get_config("broadcast_channel_id")
-        log_ch = interaction.client.get_channel(int(log_ch_id)) if log_ch_id else None
-        broadcast_ch = interaction.client.get_channel(int(broadcast_ch_id)) if broadcast_ch_id else None
+        log_ch = (interaction.client.get_channel(int(log_ch_id))
+                  if log_ch_id else None)
+        manager_role_id = db.get_config("manager_role_id")
+        mgr = f"<@&{manager_role_id}> " if manager_role_id else ""
+        label = _DISPLAY_LABEL.get(rejected_key, rejected_key or "role")
+        required = rejected_key in _REQUIRED_KEYS
 
-        if log_ch:
+        if not log_ch:
+            return
+
+        if required:
+            from cogs.talent import ReplaceRoleView
+            avail = [s for s in db.get_signups_for_match(match_id)
+                     if s["role"] != "unavailable"]
             await log_ch.send(
-                f"❌ **{name}** declined for "
-                f"**[{match['division']}] {match['team_home']} vs {match['team_away']}**. "
-                f"Re-opening talent allocation."
+                f"{mgr}❌ **{name}** rejected **{label}** for "
+                f"**[{match['division']}] {match['team_home']} vs "
+                f"{match['team_away']}**. Pick a replacement — only the new "
+                f"person will be pinged.",
+                view=ReplaceRoleView(match_id, db, avail,
+                                     preselect_role=rejected_key),
             )
-
-        from cogs.talent import send_allocation_request
-        await send_allocation_request(
-            db, match, log_ch, broadcast_ch,
-            get_teamup=interaction.client.get_teamup,
-        )
+        else:
+            await log_ch.send(
+                f"{mgr}⚠️ **{name}** rejected the optional **{label}** for "
+                f"**[{match['division']}] {match['team_home']} vs "
+                f"{match['team_away']}**. Use **Edit Allocation** on the "
+                f"sign-up message to replace them if needed."
+            )
 
 
 class ConfirmationView(discord.ui.View):

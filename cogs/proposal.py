@@ -128,6 +128,7 @@ class _DeleteButton(discord.ui.Button):
         await interaction.response.defer()
         teamup = interaction.client.get_teamup()
         old_ids: list[str] = json.loads(change.get("old_event_ids") or "[]")
+        from cogs.confirm_view import cancel_orphaned_confirmation
         for event_id in old_ids:
             if teamup:
                 try:
@@ -135,6 +136,10 @@ class _DeleteButton(discord.ui.Button):
                 except Exception as e:
                     log.warning("Delete: failed to remove event %s: %s", event_id, e)
             for m in db.get_matches_by_teamup_event_id(event_id):
+                await cancel_orphaned_confirmation(
+                    interaction.client, db, m["id"],
+                    reason="this proposal was deleted",
+                )
                 db.update_match_teamup_id(m["id"], None)
                 db.decrement_scheduled_count(m["team_home"])
                 db.decrement_scheduled_count(m["team_away"])
@@ -197,6 +202,7 @@ class _BlockDayButton(discord.ui.Button):
             return
 
         # Delete all events for the day
+        from cogs.confirm_view import cancel_orphaned_confirmation
         for m in db.get_matches_for_date(date_str):
             eid = m.get("teamup_event_id")
             if eid and teamup:
@@ -205,6 +211,10 @@ class _BlockDayButton(discord.ui.Button):
                 except Exception as e:
                     log.warning("Block: failed to remove event %s: %s", eid, e)
             if eid:
+                await cancel_orphaned_confirmation(
+                    interaction.client, db, m["id"],
+                    reason="this day was blocked",
+                )
                 db.update_match_teamup_id(m["id"], None)
                 db.decrement_scheduled_count(m["team_home"])
                 db.decrement_scheduled_count(m["team_away"])
@@ -259,6 +269,10 @@ async def _check_manager(interaction: discord.Interaction) -> bool:
     db = interaction.client.db
     is_admin = interaction.user.guild_permissions.administrator
     is_mgr = db.is_manager(str(interaction.user.id))
+    if not is_mgr:
+        role_id = db.get_config("manager_role_id")
+        if role_id:
+            is_mgr = any(str(r.id) == role_id for r in interaction.user.roles)
     if not is_admin and not is_mgr:
         await interaction.response.send_message(
             "Only managers and administrators can manage proposals.", ephemeral=True
@@ -300,8 +314,9 @@ async def _edit_old_signup_messages(old_info: list[dict], bot,
             f"⚠️ The broadcast schedule has been updated. New sign-up posts have been sent."
         )
         ping_text = None
-        if signups:
-            user_ids = list(dict.fromkeys(s["user_id"] for s in signups))
+        notifiable = [s for s in signups if s["role"] != "unavailable"]
+        if notifiable:
+            user_ids = list(dict.fromkeys(s["user_id"] for s in notifiable))
             mentions = " ".join(f"<@{uid}>" for uid in user_ids)
             content += (
                 f"\n\n{mentions} — the schedule has changed. "

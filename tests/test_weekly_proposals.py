@@ -221,6 +221,54 @@ def test_match_option_label_has_emoji_priority():
 
 
 # ---------------------------------------------------------------------------
+# recover_missed_weekly_proposals (startup catch-up)
+# ---------------------------------------------------------------------------
+
+async def test_recover_missed_weekly_proposals_creates_when_week_empty(db):
+    """Bot offline at the Sunday transition → current week has no proposal
+    rows → startup recovery creates them (today through this Sunday)."""
+    from cogs.weekly_proposals import recover_missed_weekly_proposals
+
+    today = datetime.now(ET).date()
+    week_start = (today - timedelta(days=today.weekday())).isoformat()
+    assert db.get_proposal_messages_for_week(week_start) == []  # nothing yet
+
+    db.set_config("proposal_channel_id", "555")
+    channel = AsyncMock()
+    channel.id = 555
+    channel.send = AsyncMock(return_value=MagicMock(id=999))
+    bot = MagicMock()
+    bot.get_channel = MagicMock(return_value=channel)
+
+    await recover_missed_weekly_proposals(bot, db)
+
+    rows = db.get_proposal_messages_for_week(week_start)
+    assert rows  # current week's proposals were created
+    assert channel.send.await_count >= 1
+
+
+async def test_recover_missed_weekly_proposals_noop_when_week_present(db, monkeypatch):
+    """Normal restart → current week already has proposal rows → recovery is
+    a no-op and does NOT re-run create_weekly_proposals."""
+    import cogs.weekly_proposals as wp
+    from cogs.weekly_proposals import recover_missed_weekly_proposals
+
+    today = datetime.now(ET).date()
+    week_start = (today - timedelta(days=today.weekday())).isoformat()
+    day_ts = int(datetime(today.year, today.month, today.day, tzinfo=ET).timestamp())
+    db.create_proposal_message(today.isoformat(), day_ts, week_start)
+    assert db.get_proposal_messages_for_week(week_start)  # row exists
+
+    called = AsyncMock()
+    monkeypatch.setattr(wp, "create_weekly_proposals", called)
+    bot = MagicMock()
+
+    await recover_missed_weekly_proposals(bot, db)
+
+    called.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # mark_passed_proposals
 # ---------------------------------------------------------------------------
 
@@ -313,3 +361,231 @@ async def test_unblock_day_deletes_teamup_event(db):
     await button.callback(_unblock_interaction(db, teamup=teamup))
 
     teamup.delete_event.assert_called_once_with("evt_block_123")
+
+
+# ---------------------------------------------------------------------------
+# _UpdateScheduleButton — carry-over when slot swap keeps the same time
+# ---------------------------------------------------------------------------
+
+def _update_interaction(db):
+    """Mock interaction for _UpdateScheduleButton tests (admin user).
+
+    Mirrors _unblock_interaction but adds get_channel and the
+    _proposal_selections cache used to inject the manager's slot choice.
+    """
+    interaction = MagicMock()
+    interaction.guild = MagicMock()
+    interaction.user.guild_permissions.administrator = True
+    interaction.client.db = db
+    interaction.client.get_teamup.return_value = MagicMock()
+    interaction.client.get_channel.return_value = AsyncMock()
+    interaction.client._proposal_selections = {}
+    interaction.response = AsyncMock()
+    interaction.followup = AsyncMock()
+    interaction.message = AsyncMock()
+    return interaction
+
+
+async def test_proposal_swap_same_time_carries_signups(db, monkeypatch):
+    """Swapping the slot-1 match for a different match at the SAME match_time
+    carries the old match's sign-ups onto the new match instead of posting a
+    fresh sign-up for the new match."""
+    from cogs import weekly_proposals
+
+    old = db.insert_match("Premier", "1", "Alpha", "Beta", MATCH_TS, MATCH_TS - 3600)
+    new = db.insert_match("Premier", "1", "Gamma", "Delta", MATCH_TS, MATCH_TS - 3600)
+    db.update_match_teamup_id(old, "evtOLD")
+
+    db.create_proposal_message(DATE_STR, DATE_TS, "2099-06-09")
+    db.update_proposal_slots(DATE_STR, old, None)
+    db.upsert_signup(old, "m", "producer", "u1", "user1", "U1")
+
+    # Patch the heavy collaborators so the test isolates the carry-over wiring.
+    acc = AsyncMock()
+    unsched = AsyncMock()
+    monkeypatch.setattr(weekly_proposals, "accept_combination", acc)
+    monkeypatch.setattr(weekly_proposals, "_unschedule_match", unsched)
+
+    interaction = _update_interaction(db)
+    # Manager selects `new` in slot 1, slot 2 stays empty (same mechanism the
+    # callback reads: interaction.client._proposal_selections keyed by
+    # (date_str, slot); see _UpdateScheduleButton.callback).
+    interaction.client._proposal_selections = {
+        (DATE_STR, 1): str(new),
+        (DATE_STR, 2): "none",
+    }
+
+    button = weekly_proposals._UpdateScheduleButton(DATE_STR)
+    await button.callback(interaction)
+
+    # The old match's sign-up was carried onto the new match.
+    assert {s["user_id"] for s in db.get_signups_for_match(new)} == {"u1"}
+    # The old match was still unscheduled.
+    assert old in {c.args[0] for c in unsched.call_args_list}
+    # accept_combination was used to create the new match's event/allocation
+    # (carry-over path), but NOT a second time via the fresh-path loop —
+    # exactly one call, for `new`, and no fresh duplicate sign-up post.
+    assert acc.await_count == 1
+    called_match_ids = {m["id"] for m in acc.call_args.args[0]}
+    assert called_match_ids == {new}
+
+
+async def test_proposal_swap_different_time_uses_fresh_path(db, monkeypatch):
+    """Swapping the slot-1 match for a match at a DIFFERENT match_time does NOT
+    carry the old match's sign-ups. The new match goes through the regular
+    fresh accept_combination loop, and the old match is still unscheduled."""
+    from cogs import weekly_proposals
+
+    # `new` is 3 hours after `old` (MATCH_TS2 = 10pm vs MATCH_TS = 7pm), well
+    # above any pair-gap threshold and crucially a *different* match_time.
+    old = db.insert_match("Premier", "1", "Alpha", "Beta", MATCH_TS, MATCH_TS - 3600)
+    new = db.insert_match("Premier", "1", "Gamma", "Delta", MATCH_TS2, MATCH_TS2 - 3600)
+    db.update_match_teamup_id(old, "evtOLD")
+
+    db.create_proposal_message(DATE_STR, DATE_TS, "2099-06-09")
+    db.update_proposal_slots(DATE_STR, old, None)
+    db.upsert_signup(old, "m", "producer", "u1", "user1", "U1")
+
+    # Patch the heavy collaborators so the test isolates the swap wiring.
+    acc = AsyncMock()
+    unsched = AsyncMock()
+    monkeypatch.setattr(weekly_proposals, "accept_combination", acc)
+    monkeypatch.setattr(weekly_proposals, "_unschedule_match", unsched)
+
+    interaction = _update_interaction(db)
+    # Manager selects `new` in slot 1, slot 2 stays empty (same mechanism the
+    # callback reads: interaction.client._proposal_selections keyed by
+    # (date_str, slot); see _UpdateScheduleButton.callback).
+    interaction.client._proposal_selections = {
+        (DATE_STR, 1): str(new),
+        (DATE_STR, 2): "none",
+    }
+
+    button = weekly_proposals._UpdateScheduleButton(DATE_STR)
+    await button.callback(interaction)
+
+    # Different time → no carry-over: the new match has NO sign-ups.
+    assert db.get_signups_for_match(new) == []
+    # The old match was still unscheduled.
+    assert old in {c.args[0] for c in unsched.call_args_list}
+    # The fresh accept_combination path ran for `new` (it was NOT skipped via
+    # the carry-over branch) — `new` is among the match ids passed to
+    # accept_combination.
+    fresh_called_ids = set()
+    for call in acc.call_args_list:
+        fresh_called_ids.update(m["id"] for m in call.args[0])
+    assert new in fresh_called_ids
+
+
+# ---------------------------------------------------------------------------
+# _send_schedule_update_ping
+# ---------------------------------------------------------------------------
+
+async def test_send_schedule_update_ping_returns_message(db):
+    """The helper returns the sent Message so callers can use its jump_url."""
+    from cogs.weekly_proposals import _send_schedule_update_ping
+    db.set_config("schedule_updates_channel_id", "999")
+
+    sent_msg = MagicMock()
+    sent_msg.jump_url = "https://discord.com/channels/1/2/3"
+    updates_ch = AsyncMock()
+    updates_ch.send = AsyncMock(return_value=sent_msg)
+    client = MagicMock()
+    client.get_channel = MagicMock(return_value=updates_ch)
+
+    result = await _send_schedule_update_ping(
+        DATE_STR, ["1", "2"], client, db, "test reason",
+    )
+
+    assert result is sent_msg
+    updates_ch.send.assert_awaited_once()
+    payload = updates_ch.send.call_args[0][0]
+    assert "<@1>" in payload
+    assert "<@2>" in payload
+    assert "test reason" in payload
+
+
+async def test_send_schedule_update_ping_returns_none_when_unconfigured(db):
+    """No schedule_updates_channel_id configured → returns None silently."""
+    from cogs.weekly_proposals import _send_schedule_update_ping
+    client = MagicMock()
+    result = await _send_schedule_update_ping(
+        DATE_STR, ["1"], client, db, "reason",
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _link_schedule_update_to_signups
+# ---------------------------------------------------------------------------
+
+async def test_link_schedule_update_appends_jump_url_to_signup(db):
+    """For each new match's sign-up, a 'View schedule update' link with the
+    update message's jump_url is appended."""
+    from cogs.weekly_proposals import _link_schedule_update_to_signups
+    mid = db.insert_match(
+        division="Premier", week="W1", team_home="A", team_away="B",
+        match_time=MATCH_TS, posted_at=MATCH_TS - 3600,
+    )
+    db.insert_broadcast_message(mid, "100", "999")
+
+    update_msg = MagicMock()
+    update_msg.jump_url = "https://discord.com/channels/1/2/3"
+
+    fetched_msg = AsyncMock()
+    fetched_msg.content = "ORIGINAL CONTENT"
+    fetched_msg.edit = AsyncMock()
+    signup_ch = AsyncMock()
+    signup_ch.fetch_message = AsyncMock(return_value=fetched_msg)
+
+    await _link_schedule_update_to_signups([mid], update_msg, signup_ch, db)
+
+    fetched_msg.edit.assert_awaited_once()
+    new_content = fetched_msg.edit.call_args[1]["content"]
+    assert new_content.startswith("ORIGINAL CONTENT")
+    assert "View schedule update" in new_content
+    assert update_msg.jump_url in new_content
+
+
+async def test_link_schedule_update_skips_match_without_broadcast_message(db):
+    """If a match has no broadcast_message row, the link step is silently skipped."""
+    from cogs.weekly_proposals import _link_schedule_update_to_signups
+    mid = db.insert_match(
+        division="Premier", week="W1", team_home="A", team_away="B",
+        match_time=MATCH_TS, posted_at=MATCH_TS - 3600,
+    )
+    # No insert_broadcast_message call
+
+    update_msg = MagicMock(jump_url="https://example/jump")
+    signup_ch = AsyncMock()
+
+    await _link_schedule_update_to_signups([mid], update_msg, signup_ch, db)
+
+    signup_ch.fetch_message.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Affected-signups filter: 'unavailable' role is excluded from ping recipients
+# ---------------------------------------------------------------------------
+
+async def test_unavailable_signups_excluded_from_schedule_update_ping(db):
+    """Build the same affected_signups list that _UpdateScheduleButton builds,
+    and verify users who clicked Unavailable are not in the ping recipients."""
+    mid = db.insert_match(
+        division="Premier", week="W1", team_home="A", team_away="B",
+        match_time=MATCH_TS, posted_at=MATCH_TS - 3600,
+    )
+    db.upsert_signup(mid, "msg_1", "producer",   "100", "u100", "Alice")
+    db.upsert_signup(mid, "msg_1", "observer",   "200", "u200", "Bob")
+    db.upsert_signup(mid, "msg_1", "unavailable", "300", "u300", "Carol")
+
+    affected: list[str] = []
+    for s in db.get_signups_for_match(mid):
+        if s["role"] == "unavailable":
+            continue
+        if s["user_id"] not in affected:
+            affected.append(s["user_id"])
+
+    assert "100" in affected
+    assert "200" in affected
+    assert "300" not in affected

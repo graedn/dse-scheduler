@@ -280,6 +280,58 @@ class Database:
         ).fetchone()
         return row is not None
 
+    def get_match_by_teams_in_week(self, team_home: str, team_away: str,
+                                    week_start_ts: int, week_end_ts: int) -> Optional[dict]:
+        """Return the first match for team_home vs team_away in the given Mon–Sun ET window."""
+        row = self.conn.execute(
+            "SELECT * FROM matches WHERE team_home = ? AND team_away = ? "
+            "AND match_time >= ? AND match_time <= ? LIMIT 1",
+            (team_home, team_away, week_start_ts, week_end_ts)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_scheduled_match_at_time_in_week(self, match_time: int,
+                                            week_start_ts: int,
+                                            week_end_ts: int) -> Optional[dict]:
+        """First scheduled (teamup_event_id present) match at exactly match_time
+        within the Mon–Sun ET window. Used to detect a same-time opponent swap."""
+        row = self.conn.execute(
+            "SELECT * FROM matches WHERE match_time = ? "
+            "AND match_time >= ? AND match_time <= ? "
+            "AND teamup_event_id IS NOT NULL LIMIT 1",
+            (match_time, week_start_ts, week_end_ts)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_match_cascade(self, match_id: int) -> None:
+        """Delete a match and all dependent rows (signups, broadcast message, allocation, thread)."""
+        self.conn.execute("DELETE FROM broadcast_signups WHERE match_id = ?", (match_id,))
+        self.conn.execute("DELETE FROM broadcast_messages WHERE match_id = ?", (match_id,))
+        self.conn.execute("DELETE FROM talent_allocations WHERE match_id = ?", (match_id,))
+        self.conn.execute("DELETE FROM thread_messages WHERE match_id = ?", (match_id,))
+        self.conn.execute("DELETE FROM matches WHERE id = ?", (match_id,))
+        self.conn.commit()
+
+    def clear_match_from_proposal_slots(self, match_id: int) -> None:
+        """Null out any proposal slot references to this match."""
+        self.conn.execute(
+            "UPDATE proposal_messages SET slot1_match_id = NULL WHERE slot1_match_id = ?",
+            (match_id,)
+        )
+        self.conn.execute(
+            "UPDATE proposal_messages SET slot2_match_id = NULL WHERE slot2_match_id = ?",
+            (match_id,)
+        )
+        self.conn.commit()
+
+    def update_match_time(self, match_id: int, new_match_time: int) -> None:
+        """Update a match's timestamp in-place (used when a confirmed broadcast is rescheduled)."""
+        self.conn.execute(
+            "UPDATE matches SET match_time = ? WHERE id = ?",
+            (new_match_time, match_id)
+        )
+        self.conn.commit()
+
     def get_matches_by_teamup_event_id(self, event_id: str) -> list[dict]:
         """Get all matches associated with a given TeamUp event ID."""
         rows = self.conn.execute(
@@ -492,6 +544,24 @@ class Database:
             (match_id,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def copy_signups(self, old_match_id: int, new_match_id: int) -> int:
+        """Copy all broadcast_signups rows from one match to another. Returns count copied."""
+        rows = self.conn.execute(
+            "SELECT role, user_id, username, display_name, signed_up_at "
+            "FROM broadcast_signups WHERE match_id = ?",
+            (old_match_id,)
+        ).fetchall()
+        for r in rows:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO broadcast_signups "
+                "(match_id, message_id, role, user_id, username, display_name, signed_up_at) "
+                "VALUES (?, '', ?, ?, ?, ?, ?)",
+                (new_match_id, r["role"], r["user_id"], r["username"],
+                 r["display_name"], r["signed_up_at"])
+            )
+        self.conn.commit()
+        return len(rows)
 
     def get_all_matches_with_teamup_id(self) -> list[dict]:
         rows = self.conn.execute(
@@ -708,6 +778,32 @@ class Database:
         )
         self.conn.commit()
 
+    def update_allocation_lineup(self, match_id: int, role_assignments: dict,
+                                 confirmations: dict) -> None:
+        """Update role_assignments + confirmations only, leaving status,
+        confirmation_message_id and channel intact (used by single-role swaps
+        so an accepted broadcast is not downgraded)."""
+        self.conn.execute(
+            "UPDATE talent_allocations SET role_assignments = ?, confirmations = ?, "
+            "updated_at = ? WHERE match_id = ?",
+            (json.dumps(role_assignments), json.dumps(confirmations),
+             int(time.time()), match_id)
+        )
+        self.conn.commit()
+
+    def clear_confirmation_message(self, match_id: int) -> None:
+        """Null out only the confirmation message/channel pointer, leaving
+        role_assignments/confirmations/status intact. Used after a same-time
+        carry-over hands the live confirmation message to the replacement
+        match, so a subsequent teardown of the old match does not clobber
+        the now-shared message."""
+        self.conn.execute(
+            "UPDATE talent_allocations SET confirmation_message_id = NULL, "
+            "confirmation_channel_id = NULL, updated_at = ? WHERE match_id = ?",
+            (int(time.time()), match_id)
+        )
+        self.conn.commit()
+
     def set_confirmation(self, match_id: int, user_id: str, confirmed: bool) -> None:
         row = self.conn.execute(
             "SELECT confirmations FROM talent_allocations WHERE match_id = ?",
@@ -746,6 +842,36 @@ class Database:
             "confirmation_message_id = NULL, confirmation_channel_id = NULL, "
             "updated_at = ? WHERE match_id = ?",
             (int(time.time()), match_id)
+        )
+        self.conn.commit()
+
+    def copy_allocation(self, old_match_id: int, new_match_id: int) -> None:
+        """Copy the talent_allocations row from one match onto another (upsert)."""
+        src = self.conn.execute(
+            "SELECT role_assignments, confirmations, status, "
+            "confirmation_message_id, confirmation_channel_id, "
+            "allocation_message_id, allocation_channel_id "
+            "FROM talent_allocations WHERE match_id = ?",
+            (old_match_id,)
+        ).fetchone()
+        if not src:
+            return
+        now = int(time.time())
+        self.conn.execute(
+            "INSERT OR IGNORE INTO talent_allocations "
+            "(match_id, confirmations, status, created_at, updated_at) "
+            "VALUES (?, '{}', 'pending', ?, ?)",
+            (new_match_id, now, now)
+        )
+        self.conn.execute(
+            "UPDATE talent_allocations SET role_assignments = ?, confirmations = ?, "
+            "status = ?, confirmation_message_id = ?, confirmation_channel_id = ?, "
+            "allocation_message_id = ?, allocation_channel_id = ?, updated_at = ? "
+            "WHERE match_id = ?",
+            (src["role_assignments"], src["confirmations"], src["status"],
+             src["confirmation_message_id"], src["confirmation_channel_id"],
+             src["allocation_message_id"], src["allocation_channel_id"],
+             now, new_match_id)
         )
         self.conn.commit()
 

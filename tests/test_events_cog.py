@@ -6,13 +6,21 @@ it just logs matches and dispatches 'match_logged' events.
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
 from database import Database
-from cogs.events import EventsCog
+from cogs.events import EventsCog, _week_bounds
 
 # A future timestamp (2099-01-01 20:00 UTC — well past 'now' in any test run)
 FUTURE_TS   = int(datetime(2099, 1, 1, 20, 0, tzinfo=timezone.utc).timestamp())
 FUTURE_DATE = "2099-01-01"
 PAST_TS     = int(datetime(2000, 1, 1, 20, 0, tzinfo=timezone.utc).timestamp())
+
+ET_TZ = ZoneInfo("America/New_York")
+
+# Week of 2099-06-08 (Monday) through 2099-06-14 (Sunday)
+WEEK_MON_TS = int(datetime(2099, 6, 8, 19, 0, tzinfo=ET_TZ).timestamp())
+WEEK_WED_TS = int(datetime(2099, 6, 10, 19, 0, tzinfo=ET_TZ).timestamp())
+NEXT_MON_TS = int(datetime(2099, 6, 15, 19, 0, tzinfo=ET_TZ).timestamp())
 
 
 def _make_message(content: str, is_bot=False):
@@ -253,3 +261,468 @@ async def test_on_message_ignores_wrong_channel(db):
 
     assert db.get_matches_for_date(FUTURE_DATE) == []
     cog.bot.dispatch.assert_not_called()
+
+
+# --- _week_bounds ---
+
+def test_week_bounds_monday_is_start():
+    start, end = _week_bounds(WEEK_MON_TS)
+    mon_midnight = datetime(2099, 6, 8, 0, 0, 0, tzinfo=ET_TZ)
+    assert start == int(mon_midnight.timestamp())
+
+
+def test_week_bounds_sunday_is_end():
+    start, end = _week_bounds(WEEK_MON_TS)
+    sun_end = datetime(2099, 6, 14, 23, 59, 59, tzinfo=ET_TZ)
+    assert end == int(sun_end.timestamp())
+
+
+def test_week_bounds_same_for_all_days_in_week():
+    start_mon, end_mon = _week_bounds(WEEK_MON_TS)
+    start_wed, end_wed = _week_bounds(WEEK_WED_TS)
+    assert start_mon == start_wed
+    assert end_mon == end_wed
+
+
+def test_week_bounds_differs_for_next_week():
+    start_this, _ = _week_bounds(WEEK_MON_TS)
+    start_next, _ = _week_bounds(NEXT_MON_TS)
+    assert start_this != start_next
+
+
+# --- on_message: reschedule detection ---
+
+async def test_on_message_reschedule_detected_deletes_old_match(db):
+    """When a new post appears for the same matchup in the same week with a different time,
+    the old match is removed and the new one is inserted."""
+    cog = _make_cog(db, _make_match_channel(), AsyncMock())
+
+    # Pre-insert old match on Monday
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    # New message arrives with Wednesday timestamp (same week)
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+
+    await cog.on_message(msg)
+
+    # Old match gone
+    assert db.get_match(old_id) is None
+    # New match exists
+    matches = db.get_matches_for_date("2099-06-10")
+    assert len(matches) == 1
+    assert matches[0]["match_time"] == WEEK_WED_TS
+
+
+async def test_on_message_reschedule_dispatches_match_logged_for_new_date(db):
+    cog = _make_cog(db, _make_match_channel(), AsyncMock())
+    db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    dispatched_dates = [call.args[1] for call in cog.bot.dispatch.call_args_list
+                        if call.args[0] == "match_logged"]
+    assert "2099-06-10" in dispatched_dates  # new date dispatched
+
+
+async def test_on_message_reschedule_dispatches_old_date_when_different(db):
+    cog = _make_cog(db, _make_match_channel(), AsyncMock())
+    db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    dispatched_dates = [call.args[1] for call in cog.bot.dispatch.call_args_list
+                        if call.args[0] == "match_logged"]
+    assert "2099-06-08" in dispatched_dates  # old date also dispatched
+
+
+async def test_on_message_same_time_is_duplicate_not_reschedule(db):
+    """A new post with the exact same time as an existing match is still a silent duplicate."""
+    cog = _make_cog(db, _make_match_channel(), AsyncMock())
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    msg = _make_message(_valid_post(WEEK_MON_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    assert db.get_match(old_id) is not None  # original untouched
+    assert len(db.get_matches_for_date("2099-06-08")) == 1  # no duplicate
+
+
+async def test_on_message_different_week_is_new_match(db):
+    """When a new post appears for the same matchup (Alpha vs Beta) but in a different week,
+    it is treated as a new match (not a reschedule). The old match should remain and a new
+    one should be inserted."""
+    cog = _make_cog(db, _make_match_channel(), AsyncMock())
+
+    # Pre-insert old match in week of 2099-06-08 (Monday)
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    # New message arrives for the same teams but in the next week (2099-06-15, Monday)
+    msg = _make_message(_valid_post(NEXT_MON_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+
+    await cog.on_message(msg)
+
+    # Old match should still exist (not rescheduled/deleted)
+    assert db.get_match(old_id) is not None
+    old_match = db.get_match(old_id)
+    assert old_match["match_time"] == WEEK_MON_TS
+
+    # New match should be inserted in the next week
+    new_matches = db.get_matches_for_date("2099-06-15")
+    assert len(new_matches) == 1
+    assert new_matches[0]["match_time"] == NEXT_MON_TS
+    assert new_matches[0]["team_home"] == "Alpha"
+    assert new_matches[0]["team_away"] == "Beta"
+
+
+# --- on_raw_message_edit ---
+
+import discord as discord_lib
+
+
+def _make_raw_edit_payload(message_id: int, channel_id: int):
+    payload = MagicMock(spec=discord_lib.RawMessageUpdateEvent)
+    payload.message_id = message_id
+    payload.channel_id = channel_id
+    return payload
+
+
+async def test_on_raw_message_edit_reschedule_detected(db):
+    """An edited match post with a new time triggers reschedule handling."""
+    log_ch = AsyncMock()
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    edited_msg = _make_message(_valid_post(WEEK_WED_TS))
+    edited_msg.author.bot = False
+
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=edited_msg)
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+
+    def _get_channel(ch_id):
+        if str(ch_id) == "123":
+            return ch
+        if str(ch_id) == "456":
+            return log_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    await cog.on_raw_message_edit(payload)
+
+    assert db.get_match(old_id) is None
+    assert len(db.get_matches_for_date("2099-06-10")) == 1
+
+
+async def test_on_raw_message_edit_ignores_non_match_channel(db):
+    """Edits in a different channel are ignored."""
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.set_config("match_channel_id", "123")
+    cog = _make_cog(db, _make_match_channel())
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=999)  # wrong channel
+    await cog.on_raw_message_edit(payload)
+
+    assert db.get_match(old_id) is not None  # unchanged
+
+
+async def test_on_raw_message_edit_ignores_bot_messages(db):
+    """Bot-authored edits are ignored."""
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    bot_msg = _make_message(_valid_post(WEEK_WED_TS), is_bot=True)
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=bot_msg)
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+    bot.get_channel.return_value = ch
+    db.set_config("match_channel_id", "123")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    await cog.on_raw_message_edit(payload)
+
+    assert db.get_match(old_id) is not None  # unchanged
+
+
+async def test_on_raw_message_edit_same_time_is_noop(db):
+    """An edit that doesn't change the time is silently ignored."""
+    old_id = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    edited_msg = _make_message(_valid_post(WEEK_MON_TS))  # same time
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=edited_msg)
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+    bot.get_channel.return_value = ch
+    db.set_config("match_channel_id", "123")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    await cog.on_raw_message_edit(payload)
+
+    assert db.get_match(old_id) is not None  # unchanged
+
+
+async def test_same_time_opponent_swap_carries_over(db):
+    """Editing a post to a different matchup at the SAME time as an existing
+    SCHEDULED match is treated as a same-slot opponent swap: the new matchup is
+    inserted, sign-ups carry over, and the old scheduled match is torn down."""
+    from unittest.mock import patch
+
+    ts = WEEK_WED_TS  # in the future, in a Mon–Sun ET week
+    ws, we = _week_bounds(ts)
+
+    # Scheduled match A vs B at ts, with a TeamUp event and a sign-up.
+    old_id = db.insert_match("Premier", "1", "A", "B", ts, ts - 100)
+    db.update_match_teamup_id(old_id, "evtOLD")
+    db.upsert_signup(old_id, "m", "producer", "u1", "user1", "U1")
+
+    # Edited post parses to a DIFFERENT matchup (C vs D) at the SAME ts.
+    edited_msg = _make_message(
+        f"Division: Premier\nWeek: 1\nC vs D\nTime: <t:{ts}:F>"
+    )
+    edited_msg.author.bot = False
+
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=edited_msg)
+    log_ch = AsyncMock()
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+
+    def _get_channel(ch_id):
+        if str(ch_id) == "123":
+            return ch
+        if str(ch_id) == "456":
+            return log_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    with patch.object(cog, "_handle_reschedule", new=AsyncMock()) as handle_resched:
+        await cog.on_raw_message_edit(payload)
+
+    # _handle_reschedule must NOT have run — this is the new same-time-swap branch.
+    handle_resched.assert_not_called()
+
+    # New matchup C vs D exists at ts with the sign-up carried over.
+    new = db.get_match_by_teams_in_week("C", "D", ws, we)
+    assert new is not None
+    assert new["match_time"] == ts
+    assert {s["user_id"] for s in db.get_signups_for_match(new["id"])} == {"u1"}
+
+    # Old A-vs-B scheduled match was torn down.
+    assert db.get_match_by_teams_in_week("A", "B", ws, we) is None
+    assert db.get_match(old_id) is None
+
+
+async def test_same_time_opponent_swap_accepted_keeps_teamup_event(db):
+    """An ACCEPTED scheduled match swapped to a same-time opponent via a
+    post edit must transfer its TeamUp event to the new matchup (no orphan)
+    and move that event to the Accepted sub-calendar with the new teams."""
+    import json
+    from unittest.mock import patch
+
+    ts = WEEK_WED_TS
+    ws, we = _week_bounds(ts)
+
+    old_id = db.insert_match("Premier", "1", "A", "B", ts, ts - 100)
+    db.update_match_teamup_id(old_id, "evtOLD")
+    db.upsert_signup(old_id, "m", "producer", "u1", "user1", "U1")
+    ra = {
+        "producer": {"user_id": "1", "username": "u1", "display_name": "U1"},
+        "observer": {"user_id": "1", "username": "u1", "display_name": "U1"},
+        "pbp_1":    {"user_id": "2", "username": "u2", "display_name": "U2"},
+        "colour_1": {"user_id": "3", "username": "u3", "display_name": "U3"},
+    }
+    db.create_allocation(old_id)
+    db.set_allocation_assignments(old_id, ra, {}, None, None)
+    db.set_allocation_status(old_id, "accepted")
+
+    edited_msg = _make_message(
+        f"Division: Premier\nWeek: 1\nC vs D\nTime: <t:{ts}:F>"
+    )
+    edited_msg.author.bot = False
+
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=edited_msg)
+    log_ch = AsyncMock()
+    teamup = MagicMock()
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+    bot.get_teamup = MagicMock(return_value=teamup)
+
+    def _get_channel(ch_id):
+        if str(ch_id) == "123":
+            return ch
+        if str(ch_id) == "456":
+            return log_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    cog = EventsCog(bot, db, get_teamup=lambda: teamup)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    with patch.object(cog, "_handle_reschedule", new=AsyncMock()):
+        await cog.on_raw_message_edit(payload)
+
+    new = db.get_match_by_teams_in_week("C", "D", ws, we)
+    assert new is not None
+    # TeamUp event ownership transferred to the new matchup (not orphaned).
+    assert db.get_match(new["id"])["teamup_event_id"] == "evtOLD"
+    assert db.get_match(old_id) is None
+    # carry_over moved the accepted event to the Accepted sub-calendar with
+    # the new teams.
+    teamup.update_event.assert_called_once()
+    args, kwargs = teamup.update_event.call_args
+    assert args[0] == "evtOLD"
+    assert "C vs D" in args[1]
+    assert kwargs.get("subcalendar") == "accepted"
+    # The old event was NOT deleted (reused, not orphaned).
+    teamup.delete_event.assert_not_called()
+
+
+# --- _handle_reschedule: state-based logic ---
+
+async def test_handle_reschedule_clears_proposal_slot(db):
+    """Rescheduling a match that is in a proposal slot clears the slot."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    ET2 = ZoneInfo("America/New_York")
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.create_proposal_message("2099-06-08",
+                               int(datetime(2099, 6, 8, 0, 0, tzinfo=ET2).timestamp()),
+                               "2099-06-02")
+    db.update_proposal_slots("2099-06-08", mid, None)
+
+    cog = _make_cog(db, _make_match_channel(), AsyncMock())
+
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    prop = db.get_proposal_message("2099-06-08")
+    assert prop["slot1_match_id"] is None
+
+
+async def test_handle_reschedule_sends_log_notification(db):
+    """Log channel receives a reschedule notification."""
+    log_ch = AsyncMock()
+    db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+
+    cog = _make_cog(db, _make_match_channel(), log_ch)
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    log_ch.send.assert_called_once()
+    call_text = log_ch.send.call_args[0][0]
+    assert "escheduled" in call_text  # "Rescheduled" or "rescheduled"
+    assert "Alpha" in call_text
+
+
+async def test_handle_reschedule_state3_cancels_signup_message(db):
+    """When the old match has signups, the sign-up message is edited to CANCELLED."""
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.upsert_signup(mid, "msg1", "pbp", "u1", "user1", "User One")
+    db.insert_broadcast_message(mid, "msg_discord_111", "ch_signup_999")
+
+    signup_msg = AsyncMock()
+    signup_ch = AsyncMock()
+    signup_ch.fetch_message = AsyncMock(return_value=signup_msg)
+    log_ch = AsyncMock()
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+
+    def _get_channel(ch_id):
+        if ch_id == 123:
+            return MagicMock()
+        if ch_id == 456:
+            return log_ch
+        if ch_id == 999:
+            return signup_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    db.set_config("signup_channel_id", "999")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    signup_msg.edit.assert_called_once()
+    edit_content = signup_msg.edit.call_args[1]["content"]
+    assert "CANCELLED" in edit_content or "RESCHEDULED" in edit_content
+
+
+async def test_handle_reschedule_state3_notifies_talent(db):
+    """Talent who signed up receive a schedule-update notification."""
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.upsert_signup(mid, "msg1", "pbp", "u1", "user1", "User One")
+    db.insert_broadcast_message(mid, "msg_discord_111", "ch_signup_999")
+
+    updates_ch = AsyncMock()
+    log_ch = AsyncMock()
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+
+    def _get_channel(ch_id):
+        if ch_id == 123: return MagicMock()
+        if ch_id == 456: return log_ch
+        if ch_id == 999:
+            sc = AsyncMock()
+            sc.fetch_message = AsyncMock(return_value=AsyncMock())
+            return sc
+        if ch_id == 777: return updates_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    db.set_config("signup_channel_id", "999")
+    db.set_config("schedule_updates_channel_id", "777")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    msg = _make_message(_valid_post(WEEK_WED_TS))
+    msg.channel = MagicMock()
+    msg.channel.id = 123
+    await cog.on_message(msg)
+
+    updates_ch.send.assert_called_once()
+    call_text = updates_ch.send.call_args[0][0]
+    assert "<@u1>" in call_text

@@ -1,7 +1,21 @@
 import pytest
 import time
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from database import Database
+
+ET = ZoneInfo("America/New_York")
+
+# Monday 2099-06-08 19:00 ET and Wednesday 2099-06-10 19:00 ET — same week
+WEEK_MON_TS = int(datetime(2099, 6, 8, 19, 0, tzinfo=ET).timestamp())
+WEEK_WED_TS = int(datetime(2099, 6, 10, 19, 0, tzinfo=ET).timestamp())
+# Monday 2099-06-15 19:00 ET — next week
+NEXT_WEEK_TS = int(datetime(2099, 6, 15, 19, 0, tzinfo=ET).timestamp())
+
+# Week bounds: 2099-06-08 00:00 ET (Monday) to 2099-06-14 23:59:59 ET (Sunday)
+WEEK_START = int(datetime(2099, 6, 8, 0, 0, 0, tzinfo=ET).timestamp())
+WEEK_END   = int(datetime(2099, 6, 14, 23, 59, 59, tzinfo=ET).timestamp())
 
 
 @pytest.fixture
@@ -275,6 +289,23 @@ def test_remove_signup_nonexistent_returns_false(db):
     assert db.remove_signup(mid, "pbp", "ghost-user") is False
 
 
+def test_copy_signups_rekeys_rows_to_new_match(db):
+    old = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                          match_time=1000, posted_at=900)
+    new = db.insert_match(division="D1", week="W1", team_home="C", team_away="D",
+                          match_time=1000, posted_at=900)
+    db.upsert_signup(old, "m1", "producer", "u1", "user1", "User One")
+    db.upsert_signup(old, "m1", "unavailable", "u2", "user2", "User Two")
+
+    n = db.copy_signups(old, new)
+
+    assert n == 2
+    new_sigs = {(s["role"], s["user_id"]) for s in db.get_signups_for_match(new)}
+    assert new_sigs == {("producer", "u1"), ("unavailable", "u2")}
+    # old rows untouched
+    assert len(db.get_signups_for_match(old)) == 2
+
+
 # --- Managers ---
 
 def test_add_and_is_manager(db):
@@ -466,6 +497,71 @@ def test_set_allocation_status(db):
     db.create_allocation(mid)
     db.set_allocation_status(mid, "accepted")
     assert db.get_allocation(mid)["status"] == "accepted"
+
+
+def test_update_allocation_lineup_preserves_status_and_message(db):
+    mid = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                          match_time=1000, posted_at=900)
+    db.create_allocation(mid)
+    db.set_allocation_assignments(
+        mid, {"producer": {"user_id": "u1", "username": "x", "display_name": "U1"}},
+        {"u1": True}, "cmsg", "cch")
+    db.set_allocation_status(mid, "accepted")
+
+    new_ra = {"producer": {"user_id": "u9", "username": "y", "display_name": "U9"}}
+    db.update_allocation_lineup(mid, new_ra, {"u9": None})
+
+    a = db.get_allocation(mid)
+    import json
+    assert json.loads(a["role_assignments"]) == new_ra
+    assert json.loads(a["confirmations"]) == {"u9": None}
+    assert a["status"] == "accepted"            # NOT downgraded
+    assert a["confirmation_message_id"] == "cmsg"
+    assert a["confirmation_channel_id"] == "cch"
+
+
+def test_clear_confirmation_message_nulls_only_pointer(db):
+    mid = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                          match_time=1000, posted_at=900)
+    db.create_allocation(mid)
+    db.set_allocation_assignments(
+        mid, {"producer": {"user_id": "u1", "username": "x", "display_name": "U1"}},
+        {"u1": True}, "cmsg", "cch")
+    db.set_allocation_status(mid, "accepted")
+
+    db.clear_confirmation_message(mid)
+
+    a = db.get_allocation(mid)
+    import json
+    assert a["confirmation_message_id"] is None
+    assert a["confirmation_channel_id"] is None
+    # everything else intact
+    assert a["status"] == "accepted"
+    assert json.loads(a["role_assignments"]) == {
+        "producer": {"user_id": "u1", "username": "x", "display_name": "U1"}}
+    assert json.loads(a["confirmations"]) == {"u1": True}
+
+
+def test_copy_allocation_copies_row_verbatim(db):
+    old = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                          match_time=1000, posted_at=900)
+    new = db.insert_match(division="D1", week="W1", team_home="C", team_away="D",
+                          match_time=1000, posted_at=900)
+    db.create_allocation(old)
+    ra = {"producer": {"user_id": "u1", "username": "user1", "display_name": "U1"}}
+    db.set_allocation_assignments(old, ra, {"u1": True}, "msg1", "ch1")
+    db.set_allocation_status(old, "accepted")
+
+    db.copy_allocation(old, new)
+
+    a = db.get_allocation(new)
+    assert a is not None
+    import json
+    assert json.loads(a["role_assignments"]) == ra
+    assert json.loads(a["confirmations"]) == {"u1": True}
+    assert a["status"] == "accepted"
+    assert a["confirmation_message_id"] == "msg1"
+    assert a["confirmation_channel_id"] == "ch1"
 
 
 # --- Mark broadcast accepted ---
@@ -689,3 +785,120 @@ def test_reset_all_clears_thread_messages(db):
     db.insert_thread_message(mid, "thread-1", "ch-1", None, None, 0, 0)
     db.reset_all()
     assert db.get_thread_message(mid) is None
+
+
+# --- get_match_by_teams_in_week ---
+
+def test_get_match_by_teams_in_week_finds_same_week(db):
+    db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    result = db.get_match_by_teams_in_week("Alpha", "Beta", WEEK_START, WEEK_END)
+    assert result is not None
+    assert result["match_time"] == WEEK_MON_TS
+
+
+def test_get_match_by_teams_in_week_returns_none_for_different_week(db):
+    db.insert_match("Premier", "1", "Alpha", "Beta", NEXT_WEEK_TS, NEXT_WEEK_TS - 100)
+    result = db.get_match_by_teams_in_week("Alpha", "Beta", WEEK_START, WEEK_END)
+    assert result is None
+
+
+def test_get_match_by_teams_in_week_returns_none_when_no_match(db):
+    result = db.get_match_by_teams_in_week("Alpha", "Beta", WEEK_START, WEEK_END)
+    assert result is None
+
+
+def test_get_match_by_teams_in_week_different_teams_not_found(db):
+    db.insert_match("Premier", "1", "Gamma", "Delta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    result = db.get_match_by_teams_in_week("Alpha", "Beta", WEEK_START, WEEK_END)
+    assert result is None
+
+
+def test_get_scheduled_match_at_time_in_week(db):
+    # scheduled (has teamup_event_id) at t=5000
+    m1 = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                         match_time=5000, posted_at=1)
+    db.update_match_teamup_id(m1, "evt1")
+    # unscheduled at same time — must be ignored
+    db.insert_match(division="D1", week="W1", team_home="C", team_away="D",
+                    match_time=5000, posted_at=1)
+
+    found = db.get_scheduled_match_at_time_in_week(5000, 0, 10000)
+    assert found is not None and found["id"] == m1
+
+    assert db.get_scheduled_match_at_time_in_week(9999, 0, 10000) is None
+    assert db.get_scheduled_match_at_time_in_week(5000, 6000, 10000) is None
+
+
+# --- delete_match_cascade ---
+
+def test_delete_match_cascade_removes_match(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.delete_match_cascade(mid)
+    assert db.get_match(mid) is None
+
+
+def test_delete_match_cascade_removes_signups(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.upsert_signup(mid, str(mid), "pbp", "u1", "user1", "User One")
+    db.delete_match_cascade(mid)
+    assert db.get_signups_for_match(mid) == []
+
+
+def test_delete_match_cascade_removes_broadcast_message(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.insert_broadcast_message(mid, "msg123", "ch456")
+    db.delete_match_cascade(mid)
+    assert db.get_broadcast_message(mid) is None
+
+
+def test_delete_match_cascade_removes_allocation(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.create_allocation(mid)
+    db.delete_match_cascade(mid)
+    assert db.get_allocation(mid) is None
+
+
+# --- clear_match_from_proposal_slots ---
+
+def test_clear_match_from_proposal_slots_clears_slot1(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.create_proposal_message("2099-06-08", WEEK_START, "2099-06-08")
+    db.update_proposal_slots("2099-06-08", mid, None)
+    db.clear_match_from_proposal_slots(mid)
+    prop = db.get_proposal_message("2099-06-08")
+    assert prop["slot1_match_id"] is None
+
+
+def test_clear_match_from_proposal_slots_clears_slot2(db):
+    mid1 = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    mid2 = db.insert_match("Division 1", "1", "Gamma", "Delta", WEEK_WED_TS, WEEK_WED_TS - 100)
+    db.create_proposal_message("2099-06-08", WEEK_START, "2099-06-08")
+    db.update_proposal_slots("2099-06-08", mid1, mid2)
+    db.clear_match_from_proposal_slots(mid2)
+    prop = db.get_proposal_message("2099-06-08")
+    assert prop["slot1_match_id"] == mid1
+    assert prop["slot2_match_id"] is None
+
+
+def test_clear_match_from_proposal_slots_noop_when_not_assigned(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.create_proposal_message("2099-06-08", WEEK_START, "2099-06-08")
+    db.clear_match_from_proposal_slots(mid)  # should not raise
+    prop = db.get_proposal_message("2099-06-08")
+    assert prop["slot1_match_id"] is None
+
+
+# --- update_match_time ---
+
+def test_update_match_time_changes_timestamp(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.update_match_time(mid, WEEK_WED_TS)
+    assert db.get_match(mid)["match_time"] == WEEK_WED_TS
+
+
+def test_update_match_time_other_fields_unchanged(db):
+    mid = db.insert_match("Premier", "1", "Alpha", "Beta", WEEK_MON_TS, WEEK_MON_TS - 100)
+    db.update_match_time(mid, WEEK_WED_TS)
+    match = db.get_match(mid)
+    assert match["team_home"] == "Alpha"
+    assert match["division"] == "Premier"

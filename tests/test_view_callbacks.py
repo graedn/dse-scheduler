@@ -194,7 +194,7 @@ class TestRejectButton:
         interaction.response.send_message.assert_called_once()
         assert "not required" in interaction.response.send_message.call_args[0][0]
 
-    async def test_reject_edits_message_and_reopens_allocation(self, db):
+    async def test_reject_edits_message_and_posts_replace_view(self, db):
         match_id = _insert_match(db)
         ra = _role_assignments("1", "2", "3")
         _setup_allocation(db, match_id, ra, conf_msg_id="60001")
@@ -213,13 +213,104 @@ class TestRejectButton:
         interaction = _make_interaction(db, user_id="1", msg_id="60001")
         interaction.client.get_channel.side_effect = _get_ch
 
-        # send_allocation_request is imported locally inside callback
-        with patch("cogs.talent.send_allocation_request", new_callable=AsyncMock) as mock_alloc:
-            await button.callback(interaction)
+        await button.callback(interaction)
 
+        # Confirmation message edited in place; decliner shows [Rejected].
         interaction.response.edit_message.assert_called_once()
-        assert "rejected" in interaction.response.edit_message.call_args[1]["content"]
-        mock_alloc.assert_called_once()
+        assert "[Rejected]" in interaction.response.edit_message.call_args[1]["content"]
+
+        # Allocation is NOT reset (single-role replace, not full re-allocation).
+        a = db.get_allocation(match_id)
+        assert a["role_assignments"] is not None
+        assert a["status"] == "awaiting_confirm"
+
+        # Required-role rejecter → a pre-selected ReplaceRoleView is posted.
+        from cogs.talent import ReplaceRoleView
+        sent_views = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
+        assert any(isinstance(v, ReplaceRoleView) for v in sent_views)
+
+    async def test_reject_marks_user_unavailable_and_shows_rejected_tag(self, db):
+        """After clicking Reject, the rejecter's sign-up becomes 'unavailable',
+        their unavailable_count increments, and the confirmation message content
+        shows [Rejected] for them."""
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra, conf_msg_id="70001")
+        # Existing role signup for u1 — should be replaced by 'unavailable'.
+        db.upsert_signup(match_id, "m1", "producer", "1", "u1", "User1")
+        # Broadcast message row so RejectButton can resolve signup_message_id.
+        db.insert_broadcast_message(match_id, "m1", "222")
+        db.set_config("log_channel_id", "111")
+        db.set_config("broadcast_channel_id", "222")
+
+        button = self._button_in_view(match_id)
+        interaction = _make_interaction(db, user_id="1", msg_id="70001")
+        interaction.client.get_channel.return_value = AsyncMock()
+
+        await button.callback(interaction)
+
+        # Sign-up is now 'unavailable' (prior role rows removed)
+        sigs_for_u1 = [s for s in db.get_signups_for_match(match_id)
+                       if s["user_id"] == "1"]
+        assert len(sigs_for_u1) == 1
+        assert sigs_for_u1[0]["role"] == "unavailable"
+
+        # Talent counter: unavailable_count == 1
+        row = next(r for r in db.get_all_talent() if r["user_id"] == "1")
+        assert row["unavailable_count"] == 1
+
+        # Edited content includes the [Rejected] tag for the decliner
+        content = interaction.response.edit_message.call_args[1]["content"]
+        assert "[Rejected]" in content
+
+
+class TestRejectSingleRoleReplace:
+    def _btn(self, match_id):
+        from cogs.confirm_view import ConfirmationView, RejectButton
+        v = ConfirmationView(match_id)
+        return next(c for c in v.children if isinstance(c, RejectButton))
+
+    async def test_required_reject_posts_replace_view_no_reset(self, db):
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra, conf_msg_id="70001")
+        db.set_config("log_channel_id", "111")
+        db.set_confirmation(match_id, "2", True)
+        log_ch = AsyncMock()
+        btn = self._btn(match_id)
+        interaction = _make_interaction(db, user_id="3", msg_id="70001")  # colour_1 rejects
+        interaction.client.get_channel = MagicMock(return_value=log_ch)
+
+        await btn.callback(interaction)
+
+        a = db.get_allocation(match_id)
+        assert a["role_assignments"] is not None
+        assert a["status"] == "awaiting_confirm"
+        assert db.get_confirmations(match_id).get("2") is True
+        from cogs.talent import ReplaceRoleView
+        sent_views = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
+        assert any(isinstance(v, ReplaceRoleView) for v in sent_views)
+
+    async def test_optional_reject_flags_only(self, db):
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        ra["host"] = {"user_id": "8", "username": "u8", "display_name": "H8"}
+        _setup_allocation(db, match_id, ra, conf_msg_id="70002")
+        db.set_config("log_channel_id", "111")
+        db.set_confirmation(match_id, "8", None)
+        log_ch = AsyncMock()
+        btn = self._btn(match_id)
+        interaction = _make_interaction(db, user_id="8", msg_id="70002")
+        interaction.client.get_channel = MagicMock(return_value=log_ch)
+
+        await btn.callback(interaction)
+
+        from cogs.talent import ReplaceRoleView
+        sent_views = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
+        assert not any(isinstance(v, ReplaceRoleView) for v in sent_views)
+        assert any("rejected the optional" in str(c).lower()
+                   for c in log_ch.send.call_args_list)
+        assert db.get_allocation(match_id)["status"] == "awaiting_confirm"
 
 
 # ===========================================================================
@@ -519,10 +610,10 @@ class TestBuildConfirmationMessage:
         ra = self._ra()
         confs = {"1": None, "2": None, "3": None, "4": None}
         content = build_confirmation_message(self._match(), ra, confs)
-        # Host is optional — should not show [No Response]
+        # Host is optional — now shows a status tag like required roles
         lines = [l for l in content.splitlines() if "Eve" in l]
         assert lines
-        assert "No Response" not in lines[0]
+        assert "[No Response]" in lines[0]
         assert "optional" in lines[0].lower()
 
     def test_shows_single_pbp_and_colour(self):
@@ -559,6 +650,30 @@ class TestBuildConfirmationMessage:
         confs = {"1": True, "2": None, "3": None, "4": None}
         content = build_confirmation_message(self._match(), ra, confs)
         assert "[Ready]" in content
+
+
+class TestOptionalRendering:
+    def _match(self):
+        return {"division": "D1", "team_home": "A", "team_away": "B",
+                "match_time": 1700000000}
+
+    def test_optional_shows_status_tag_and_awaits(self):
+        from cogs.confirm_view import build_confirmation_message
+        ra = {
+            "producer":  {"user_id": "1", "username": "u1", "display_name": "P"},
+            "observer":  {"user_id": "1", "username": "u1", "display_name": "P"},
+            "pbp_1":     {"user_id": "2", "username": "u2", "display_name": "PB"},
+            "colour_1":  {"user_id": "3", "username": "u3", "display_name": "C"},
+            "host":      {"user_id": "8", "username": "u8", "display_name": "H8"},
+            "analyst_1": {"user_id": "9", "username": "u9", "display_name": "A9"},
+        }
+        confs = {"1": True, "2": True, "3": True, "8": None, "9": False}
+        content = build_confirmation_message(self._match(), ra, confs)
+        assert "**Host** (optional): <@8> — H8 [No Response]" in content
+        assert "**Analyst** (optional): <@9> — A9 [Rejected]" in content
+        awaiting = content.split("Awaiting confirmation from:")[-1]
+        assert "<@8>" in awaiting
+        assert "<@9>" not in awaiting
 
 
 class TestBuildTalentDescription:
@@ -678,6 +793,238 @@ class TestCancelBroadcast:
 
 
 # ===========================================================================
+# cancel_orphaned_confirmation helper + stale-click safety net
+# ===========================================================================
+
+class TestCancelOrphanedConfirmation:
+    """The helper edits the active confirmation message into a cancelled state
+    BEFORE reset_allocation/delete_match_cascade wipes the message ID."""
+
+    async def test_edits_message_when_confirmation_present(self, db):
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra,
+                          conf_msg_id="80001", conf_ch_id="888")
+
+        fetched_msg = AsyncMock()
+        fetched_msg.content = "ORIGINAL"
+        fetched_msg.edit = AsyncMock()
+        channel = AsyncMock()
+        channel.fetch_message = AsyncMock(return_value=fetched_msg)
+        bot = MagicMock()
+        bot.get_channel = MagicMock(return_value=channel)
+
+        await cancel_orphaned_confirmation(bot, db, match_id, reason="test reason")
+
+        bot.get_channel.assert_called_once_with(888)
+        channel.fetch_message.assert_awaited_once_with(80001)
+        fetched_msg.edit.assert_awaited_once()
+        new_content = fetched_msg.edit.call_args[1]["content"]
+        assert new_content.startswith("ORIGINAL")
+        assert "Talent confirmation cancelled" in new_content
+        assert "test reason" in new_content
+
+    async def test_no_op_when_confirmation_message_id_missing(self, db):
+        """After reset_allocation, conf_msg_id is NULL — helper must not crash."""
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        match_id = _insert_match(db)
+        db.create_allocation(match_id)  # no confirmation_message_id set
+
+        bot = MagicMock()
+        bot.get_channel = MagicMock()
+
+        await cancel_orphaned_confirmation(bot, db, match_id)
+
+        bot.get_channel.assert_not_called()
+
+    async def test_no_op_when_no_allocation_row(self, db):
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        bot = MagicMock()
+        bot.get_channel = MagicMock()
+
+        await cancel_orphaned_confirmation(bot, db, match_id=99999)
+
+        bot.get_channel.assert_not_called()
+
+    async def test_no_op_when_channel_uncached(self, db):
+        """get_channel returning None (cache miss) is not an error."""
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra,
+                          conf_msg_id="80002", conf_ch_id="999")
+
+        bot = MagicMock()
+        bot.get_channel = MagicMock(return_value=None)
+
+        await cancel_orphaned_confirmation(bot, db, match_id)
+
+        bot.get_channel.assert_called_once_with(999)
+        # No exception raised
+
+
+class TestStaleClickSafetyNet:
+    """When Ready/Reject hits the 'no longer active' branch, the message is
+    edited in place so subsequent talent see the cancellation."""
+
+    async def test_ready_click_on_orphaned_alloc_edits_message(self, db):
+        from cogs.confirm_view import ConfirmationView, ReadyButton
+        match_id = _insert_match(db)
+        # No allocation row at all → "no longer active" branch
+        view = ConfirmationView(match_id)
+        button = next(c for c in view.children if isinstance(c, ReadyButton))
+
+        interaction = _make_interaction(db, user_id="1", msg_id="no_such",
+                                         msg_content="ORIGINAL CONTENT")
+        interaction.message = AsyncMock()
+        interaction.message.id = "no_such"
+        interaction.message.content = "ORIGINAL CONTENT"
+
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        assert "no longer active" in interaction.response.send_message.call_args[0][0]
+        interaction.message.edit.assert_awaited_once()
+        new_content = interaction.message.edit.call_args[1]["content"]
+        assert new_content.startswith("ORIGINAL CONTENT")
+        assert "Talent confirmation cancelled" in new_content
+
+    async def test_reject_click_on_orphaned_alloc_edits_message(self, db):
+        from cogs.confirm_view import ConfirmationView, RejectButton
+        match_id = _insert_match(db)
+        view = ConfirmationView(match_id)
+        button = next(c for c in view.children if isinstance(c, RejectButton))
+
+        interaction = _make_interaction(db, user_id="1", msg_id="no_such",
+                                         msg_content="ORIGINAL CONTENT")
+        interaction.message = AsyncMock()
+        interaction.message.id = "no_such"
+        interaction.message.content = "ORIGINAL CONTENT"
+
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        interaction.message.edit.assert_awaited_once()
+        assert "Talent confirmation cancelled" in interaction.message.edit.call_args[1]["content"]
+
+    async def test_safety_net_idempotent_does_not_double_append(self, db):
+        """If the message has already been cleaned up, don't append again."""
+        from cogs.confirm_view import _stale_message_cleanup
+        suffix = "⏏️ **Talent confirmation cancelled** — this broadcast is no longer scheduled."
+        interaction = MagicMock()
+        interaction.message = AsyncMock()
+        interaction.message.content = "ORIGINAL\n\n" + suffix
+        interaction.message.edit = AsyncMock()
+
+        await _stale_message_cleanup(interaction)
+
+        interaction.message.edit.assert_not_called()
+
+
+# ===========================================================================
+# UnavailableButton — talent counter behaviour
+# ===========================================================================
+
+class TestUnavailableButton:
+    def _button_and_view(self, match_id):
+        from cogs.signup import SignUpView, UnavailableButton
+        view = SignUpView(match_id)
+        button = next(c for c in view.children if isinstance(c, UnavailableButton))
+        return button, view
+
+    def _interaction(self, db_instance, user_id="1", display_name="Alice"):
+        interaction = _make_interaction(db_instance, user_id=user_id, msg_id="sm_1")
+        member = MagicMock()
+        member.display_name = display_name
+        member.__str__ = lambda self: f"user#{user_id}"
+        interaction.guild.fetch_member = AsyncMock(return_value=member)
+        return interaction
+
+    async def test_unavailable_click_does_not_increment_response_count(self, db):
+        """Regression: clicking Unavailable on a fresh match must NOT add
+        to response_count — only unavailable_count should go up."""
+        match_id = _insert_match(db)
+        db.insert_broadcast_message(match_id, "sm_1", "999")
+
+        button, _view = self._button_and_view(match_id)
+        interaction = self._interaction(db, user_id="1", display_name="Alice")
+
+        await button.callback(interaction)
+
+        row = next(r for r in db.get_all_talent() if r["user_id"] == "1")
+        assert row["unavailable_count"] == 1
+        assert row["response_count"] == 0
+
+    async def test_unavailable_toggle_off_does_not_increment(self, db):
+        """Clicking Unavailable twice (toggle off) must not keep adding to
+        unavailable_count on the un-toggle click."""
+        match_id = _insert_match(db)
+        db.insert_broadcast_message(match_id, "sm_1", "999")
+
+        button, _view = self._button_and_view(match_id)
+        interaction = self._interaction(db, user_id="1", display_name="Alice")
+
+        await button.callback(interaction)
+        await button.callback(interaction)
+
+        row = next(r for r in db.get_all_talent() if r["user_id"] == "1")
+        assert row["unavailable_count"] == 1
+        assert row["response_count"] == 0
+
+
+# ===========================================================================
+# send_allocation_request — filter out 'unavailable' signups
+# ===========================================================================
+
+class TestSendAllocationRequestFiltersUnavailable:
+    async def test_unavailable_signups_excluded_from_allocation_view(self, db):
+        """Users who clicked Unavailable must not appear as options in the
+        AllocationView sent to the log channel."""
+        from cogs.talent import send_allocation_request, AllocationView
+        match_id = _insert_match(db)
+        # One normal role signup and one unavailable signup
+        db.upsert_signup(match_id, "sm_1", "producer", "1", "u1", "Alice")
+        db.upsert_signup(match_id, "sm_1", "unavailable", "2", "u2", "Bob")
+
+        log_ch = AsyncMock()
+        log_ch.send = AsyncMock(return_value=MagicMock(id=999))
+        match = db.get_match(match_id)
+
+        await send_allocation_request(db, match, log_ch, AsyncMock())
+
+        log_ch.send.assert_called_once()
+        view_arg = log_ch.send.call_args[1].get("view") or log_ch.send.call_args[0][1]
+        assert isinstance(view_arg, AllocationView)
+        signup_user_ids = {s["user_id"] for s in view_arg.signups}
+        assert "1" in signup_user_ids
+        assert "2" not in signup_user_ids
+
+    async def test_allocation_view_built_with_filtered_signups_excludes_unavailable(self, db):
+        """AllocationView constructed via send_allocation_request receives
+        signups with 'unavailable' rows filtered out."""
+        from cogs.talent import send_allocation_request, AllocationView
+        match_id = _insert_match(db)
+        for role, uid, name in [("producer", "1", "Alice"),
+                                 ("observer", "2", "Bob"),
+                                 ("unavailable", "3", "Carol"),
+                                 ("pbp", "4", "Dave")]:
+            db.upsert_signup(match_id, "sm_1", role, uid, f"u{uid}", name)
+
+        log_ch = AsyncMock()
+        log_ch.send = AsyncMock(return_value=MagicMock(id=999))
+        match = db.get_match(match_id)
+
+        await send_allocation_request(db, match, log_ch, AsyncMock())
+
+        view_arg = log_ch.send.call_args[1].get("view") or log_ch.send.call_args[0][1]
+        assert isinstance(view_arg, AllocationView)
+        ids_in_view = {s["user_id"] for s in view_arg.signups}
+        assert ids_in_view == {"1", "2", "4"}
+        assert "Carol" not in log_ch.send.call_args[0][0]
+
+
+# ===========================================================================
 # H4 — _NewMatchSelect replacement flow
 # ===========================================================================
 
@@ -794,3 +1141,456 @@ class TestNewMatchSelect:
         # A ping with @mentions should be sent
         ping_calls = [c for c in signup_ch.send.call_args_list if "<@" in str(c)]
         assert len(ping_calls) >= 1
+
+
+# ===========================================================================
+# Task 13b — New Match same-time swap carries over silently (no re-ping);
+#            different-time swap unchanged (still cancels + re-pings).
+# ===========================================================================
+
+class TestNewMatchCarryOver:
+    def _select(self, current_match_id, replacements, db):
+        from cogs.signup import _NewMatchSelect
+        return _NewMatchSelect(current_match_id, replacements, db)
+
+    def _set_values(self, select, values):
+        """discord.ui.Select.values is read-only; set the internal _values attribute."""
+        select._values = values
+
+    async def test_same_time_accepted_swap_carries_without_reping(self, db):
+        # `cur` is an ACCEPTED broadcast; `repl` shares the SAME match_time.
+        cur = _insert_match(db, TS_8PM, home="Team A", away="Team B")
+        repl = _insert_match(db, TS_8PM, home="Team C", away="Team D")
+        db.update_match_teamup_id(cur, "evtC")
+        db.set_config("signup_channel_id", "99")
+        db.set_config("schedule_updates_channel_id", "77")
+
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, cur, ra, status="accepted",
+                          conf_msg_id="CM1", conf_ch_id="888")
+        db.set_confirmation(cur, "1", True)
+        db.set_confirmation(cur, "2", True)
+        db.set_confirmation(cur, "3", True)
+        db.mark_broadcast_accepted(cur)
+        db.upsert_signup(cur, "m", "producer", "u1", "user1", "U1")
+
+        select = self._select(cur, [db.get_match(repl)], db)
+        self._set_values(select, [str(repl)])
+
+        signup_ch = AsyncMock()
+        interaction = _make_interaction(db, user_id="1")
+        interaction.client.get_teamup.return_value = MagicMock()
+        interaction.client.get_channel.return_value = signup_ch
+
+        with patch("scheduler.accept_combination", new_callable=AsyncMock):
+            await select.callback(interaction)
+
+        # (a) sign-ups carried over to the replacement
+        assert "u1" in {s["user_id"] for s in db.get_signups_for_match(repl)}
+        # (b) allocation carried over with role assignments + status accepted
+        repl_alloc = db.get_allocation(repl)
+        assert repl_alloc is not None
+        assert repl_alloc["role_assignments"] not in (None, "", "{}")
+        assert repl_alloc["status"] == "accepted"
+        # (c) NO talent re-ping was sent (no channel send with replaced + mention)
+        all_sends = (
+            [str(c) for c in signup_ch.send.call_args_list]
+            + [str(c) for c in interaction.client.get_channel.return_value.send.call_args_list]
+        )
+        reping_calls = [s for s in all_sends if "replaced" in s and "<@" in s]
+        assert reping_calls == []
+        # (d) replacement remains an accepted broadcast
+        assert db.get_match(repl)["broadcast_accepted"] == 1
+
+    async def test_different_time_swap_unchanged_still_cancels_and_pings(self, db):
+        # `cur` accepted; `repl` at a DIFFERENT match_time -> old behaviour.
+        cur = _insert_match(db, TS_8PM, home="Team A", away="Team B")
+        repl = _insert_match(db, TS_10PM, home="Team C", away="Team D")
+        db.update_match_teamup_id(cur, "evtAcc")
+        db.set_config("signup_channel_id", "99")
+
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(cur)
+        db.set_allocation_assignments(cur, ra, {}, None, None)
+        db.set_allocation_status(cur, "accepted")
+        db.mark_broadcast_accepted(cur)
+
+        signup_ch = AsyncMock()
+        select = self._select(cur, [db.get_match(repl)], db)
+        self._set_values(select, [str(repl)])
+
+        interaction = _make_interaction(db, user_id="1")
+        interaction.client.get_teamup.return_value = MagicMock()
+        interaction.client.get_channel.return_value = signup_ch
+
+        with patch("scheduler.accept_combination", new_callable=AsyncMock):
+            await select.callback(interaction)
+
+        # No carry-over for a different-time swap
+        assert db.get_signups_for_match(repl) == []
+        # Allocated-talent re-ping WAS sent (mentions + replaced notice)
+        ping_calls = [c for c in signup_ch.send.call_args_list
+                      if "<@" in str(c) and "replaced" in str(c)]
+        assert len(ping_calls) >= 1
+        # Old allocation reset (role_assignments nulled)
+        old_alloc = db.get_allocation(cur)
+        assert old_alloc is None or old_alloc["role_assignments"] in (None, "", "{}")
+
+    async def test_same_time_signup_stage_swap_carries_signups_no_cancel(self, db):
+        # `cur` NOT accepted (sign-up stage), has teamup event + a sign-up,
+        # no confirmations; `repl` at the SAME time.
+        cur = _insert_match(db, TS_8PM, home="Team A", away="Team B")
+        repl = _insert_match(db, TS_8PM, home="Team C", away="Team D")
+        db.update_match_teamup_id(cur, "evtS")
+        db.set_config("signup_channel_id", "99")
+        db.upsert_signup(cur, "m", "producer", "u1", "user1", "U1")
+
+        # An original sign-up message exists for `cur` so we can inspect its edit.
+        db.insert_broadcast_message(cur, "5555", "99")
+
+        edited = {}
+        old_msg = AsyncMock()
+
+        async def _edit(**kwargs):
+            edited["content"] = kwargs.get("content")
+            edited["view"] = kwargs.get("view")
+        old_msg.edit = _edit
+
+        signup_ch = AsyncMock()
+        signup_ch.fetch_message = AsyncMock(return_value=old_msg)
+
+        select = self._select(cur, [db.get_match(repl)], db)
+        self._set_values(select, [str(repl)])
+
+        interaction = _make_interaction(db, user_id="1")
+        interaction.client.get_teamup.return_value = MagicMock()
+        interaction.client.get_channel.return_value = signup_ch
+
+        with patch("scheduler.accept_combination", new_callable=AsyncMock):
+            await select.callback(interaction)
+
+        # Sign-up carried to replacement
+        assert "u1" in {s["user_id"] for s in db.get_signups_for_match(repl)}
+        # Old sign-up message edited to the neutral moved notice
+        assert edited.get("content") is not None
+        assert "♻️" in edited["content"]
+        assert "different match at the same time" in edited["content"]
+        assert "CANCELLED" not in edited["content"]
+        assert "<@" not in edited["content"]
+
+
+# ===========================================================================
+# Optional roles tracked in confirmations but never gate finalization
+# ===========================================================================
+
+class TestOptionalDoesNotGate:
+    def _ready(self, match_id):
+        from cogs.confirm_view import ConfirmationView, ReadyButton
+        v = ConfirmationView(match_id)
+        return next(c for c in v.children if isinstance(c, ReadyButton))
+
+    async def test_all_required_ready_finalizes_with_optional_pending(self, db):
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        ra["host"] = {"user_id": "9", "username": "u9", "display_name": "Host9"}
+        _setup_allocation(db, match_id, ra, conf_msg_id="C1")
+        db.set_confirmation(match_id, "9", None)
+        db.set_confirmation(match_id, "2", True)
+        db.set_confirmation(match_id, "3", True)
+        button = self._ready(match_id)
+        interaction = _make_interaction(db, user_id="1", msg_id="C1")
+        with patch("cogs.confirm_view._finalize_match", new_callable=AsyncMock) as fin:
+            await button.callback(interaction)
+        fin.assert_called_once()
+
+    async def test_required_pending_blocks_even_if_optional_ready(self, db):
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        ra["analyst_1"] = {"user_id": "9", "username": "u9", "display_name": "An9"}
+        _setup_allocation(db, match_id, ra, conf_msg_id="C2")
+        db.set_confirmation(match_id, "9", True)
+        button = self._ready(match_id)
+        interaction = _make_interaction(db, user_id="1", msg_id="C2")
+        with patch("cogs.confirm_view._finalize_match", new_callable=AsyncMock) as fin:
+            await button.callback(interaction)
+        fin.assert_not_called()
+
+
+# ===========================================================================
+# Task 7 — replace_allocation_role
+# ===========================================================================
+
+class TestReplaceAllocationRole:
+    async def test_swap_resets_only_new_person_keeps_others(self, db):
+        from cogs.talent import replace_allocation_role
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra, conf_msg_id="7001", conf_ch_id="900")
+        db.set_confirmation(match_id, "1", True)
+        db.set_confirmation(match_id, "2", True)
+        db.set_confirmation(match_id, "3", True)
+        db.set_allocation_status(match_id, "accepted")
+
+        ch = AsyncMock()
+        fetched = AsyncMock(); fetched.content = "OLD"; fetched.edit = AsyncMock()
+        ch.fetch_message = AsyncMock(return_value=fetched)
+        ch.send = AsyncMock()
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=ch)
+
+        new_person = {"user_id": "7", "username": "u7", "display_name": "New7"}
+        await replace_allocation_role(bot, db, match_id, "colour_1", new_person)
+
+        import json
+        a = db.get_allocation(match_id)
+        ra2 = json.loads(a["role_assignments"])
+        confs = json.loads(a["confirmations"])
+        assert ra2["colour_1"]["user_id"] == "7"
+        assert confs["7"] is None
+        assert confs["1"] is True
+        assert confs["2"] is True
+        assert "3" not in confs
+        assert a["status"] == "accepted"
+        fetched.edit.assert_awaited()
+        ch.send.assert_awaited()
+        ping = ch.send.call_args
+        assert "<@7>" in str(ping)
+
+    async def test_outgoing_kept_if_holds_other_role(self, db):
+        from cogs.talent import replace_allocation_role
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")  # u1 = producer AND observer
+        _setup_allocation(db, match_id, ra, conf_msg_id="7002", conf_ch_id="900")
+        db.set_confirmation(match_id, "1", True)
+        bot = MagicMock(); bot.db = db
+        ch = AsyncMock()
+        ch.fetch_message = AsyncMock(return_value=AsyncMock(content="x", edit=AsyncMock()))
+        ch.send = AsyncMock()
+        bot.get_channel = MagicMock(return_value=ch)
+
+        await replace_allocation_role(bot, db, match_id, "observer",
+                                      {"user_id": "5", "username": "u5", "display_name": "F5"})
+        import json
+        confs = json.loads(db.get_allocation(match_id)["confirmations"])
+        assert confs["1"] is True   # u1 still producer -> confirmation kept
+        assert confs["5"] is None
+
+
+# ===========================================================================
+# Task 8 — ReplaceRoleView
+# ===========================================================================
+
+class TestReplaceRoleView:
+    def _view(self, db, match_id, signups, role_key=None):
+        from cogs.talent import ReplaceRoleView
+        return ReplaceRoleView(match_id, db, signups, preselect_role=role_key)
+
+    async def test_apply_calls_replace_with_selected_role_and_user(self, db):
+        from cogs.talent import ReplaceRoleView, _ReplaceApplyButton
+        match_id = _insert_match(db)
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, match_id, ra, conf_msg_id="V1", conf_ch_id="900")
+        db.upsert_signup(match_id, "m", "colour", "7", "u7", "New7")
+        signups = db.get_signups_for_match(match_id)
+
+        view = self._view(db, match_id, signups, role_key="colour_1")
+        view.selected_role = "colour_1"
+        view.selected_user = "7"
+        button = next(c for c in view.children if isinstance(c, _ReplaceApplyButton))
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+
+        with patch("cogs.talent.replace_allocation_role",
+                   new_callable=AsyncMock) as rep:
+            await button.callback(interaction)
+
+        rep.assert_awaited_once()
+        args = rep.await_args[0]
+        assert args[2] == match_id and args[3] == "colour_1"
+        assert args[4]["user_id"] == "7"
+
+    async def test_apply_denied_for_non_manager(self, db):
+        from cogs.talent import _ReplaceApplyButton
+        match_id = _insert_match(db)
+        _setup_allocation(db, match_id, _role_assignments("1", "2", "3"))
+        view = self._view(db, match_id, [])
+        button = next(c for c in view.children if isinstance(c, _ReplaceApplyButton))
+        interaction = _make_interaction(db, user_id="1", is_admin=False)
+        interaction.guild = MagicMock()
+        db.is_manager = MagicMock(return_value=False)
+        await button.callback(interaction)
+        interaction.response.send_message.assert_called_once()
+        assert "manager" in interaction.response.send_message.call_args[0][0].lower()
+
+
+class TestEditAllocationButton:
+    def _btn(self, match_id):
+        from cogs.signup import ApprovedSignUpView, EditAllocationButton
+        v = ApprovedSignUpView(match_id)
+        return next(c for c in v.children if isinstance(c, EditAllocationButton))
+
+    async def test_non_manager_denied(self, db):
+        match_id = _insert_match(db)
+        btn = self._btn(match_id)
+        interaction = _make_interaction(db, user_id="1", is_admin=False)
+        interaction.guild = MagicMock()
+        db.is_manager = MagicMock(return_value=False)
+        await btn.callback(interaction)
+        interaction.response.send_message.assert_called_once()
+        assert "manager" in interaction.response.send_message.call_args[0][0].lower()
+
+    async def test_manager_posts_replace_view_to_log(self, db):
+        match_id = _insert_match(db)
+        _setup_allocation(db, match_id, _role_assignments("1", "2", "3"))
+        db.set_config("log_channel_id", "111")
+        log_ch = AsyncMock()
+        btn = self._btn(match_id)
+        interaction = _make_interaction(db, user_id="1", is_admin=True)
+        interaction.guild = MagicMock()
+        interaction.client.get_channel = MagicMock(return_value=log_ch)
+        await btn.callback(interaction)
+        from cogs.talent import ReplaceRoleView
+        sent = [c.kwargs.get("view") for c in log_ch.send.call_args_list]
+        assert any(isinstance(v, ReplaceRoleView) for v in sent)
+
+
+class TestCarryOverIfSameTime:
+    async def test_same_time_copies_signups_and_allocation(self, db):
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db)  # default match_time
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=db.get_match(old)["match_time"],
+                              posted_at=1)
+        db.upsert_signup(old, "m", "producer", "1", "u1", "U1")
+        db.create_allocation(old)
+        db.set_allocation_status(old, "accepted")
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=None)
+
+        note = await carry_over_if_same_time(bot, db, old, new)
+
+        assert note is not None
+        assert {s["user_id"] for s in db.get_signups_for_match(new)} == {"1"}
+        assert db.get_allocation(new)["status"] == "accepted"
+
+    async def test_different_time_returns_none_and_copies_nothing(self, db):
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db)
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=db.get_match(old)["match_time"] + 3600,
+                              posted_at=1)
+        db.upsert_signup(old, "m", "producer", "1", "u1", "U1")
+        bot = MagicMock(); bot.db = db
+        note = await carry_over_if_same_time(bot, db, old, new)
+        assert note is None
+        assert db.get_signups_for_match(new) == []
+
+    async def test_accepted_carry_moves_teamup_event_to_accepted(self, db):
+        """An accepted carry must move the replacement's TeamUp event to the
+        Accepted sub-calendar with the new teams' title (spec Component 1)."""
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db, home="A", away="B")
+        ts = db.get_match(old)["match_time"]
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=ts, posted_at=1)
+        db.update_match_teamup_id(new, "evtNEW")
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(old)
+        db.set_allocation_assignments(old, ra, {}, None, None)
+        db.set_allocation_status(old, "accepted")
+        teamup = MagicMock()
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=None)
+        bot.get_teamup = MagicMock(return_value=teamup)
+
+        await carry_over_if_same_time(bot, db, old, new)
+
+        teamup.update_event.assert_called_once()
+        args, kwargs = teamup.update_event.call_args
+        assert args[0] == "evtNEW"
+        assert "C vs D" in args[1]
+        assert kwargs.get("subcalendar") == "accepted"
+
+    async def test_awaiting_confirm_carry_does_not_move_teamup_event(self, db):
+        """awaiting_confirm (not yet finalized) must NOT move the event to
+        Accepted — it stays on Proposed until real finalize."""
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db, home="A", away="B")
+        ts = db.get_match(old)["match_time"]
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=ts, posted_at=1)
+        db.update_match_teamup_id(new, "evtNEW")
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(old)
+        db.set_allocation_assignments(old, ra, {}, None, None)  # → awaiting_confirm
+        teamup = MagicMock()
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=None)
+        bot.get_teamup = MagicMock(return_value=teamup)
+
+        await carry_over_if_same_time(bot, db, old, new)
+
+        teamup.update_event.assert_not_called()
+
+    async def test_carry_clears_old_confirmation_pointer_so_teardown_no_ops(self, db):
+        """Regression: after an awaiting/accepted carry, the OLD match's
+        confirmation_message_id is cleared so a subsequent
+        cancel_orphaned_confirmation(old) is a no-op and does NOT clobber the
+        shared live confirmation message (Ready/Reject must stay usable)."""
+        from cogs.talent import carry_over_if_same_time
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        old = _insert_match(db, home="A", away="B")
+        ts = db.get_match(old)["match_time"]
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=ts, posted_at=1)
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(old)
+        db.set_allocation_assignments(old, ra, {"1": None, "2": None, "3": None},
+                                      "9001", "900")  # status -> awaiting_confirm
+
+        conf_msg = AsyncMock()
+        conf_msg.content = "ORIGINAL"
+        conf_msg.edit = AsyncMock()
+        channel = AsyncMock()
+        channel.fetch_message = AsyncMock(return_value=conf_msg)
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=channel)
+
+        await carry_over_if_same_time(bot, db, old, new)
+
+        # Ownership moved to the replacement; old pointer cleared.
+        assert db.get_allocation(old)["confirmation_message_id"] is None
+        assert db.get_allocation(new)["confirmation_message_id"] == "9001"
+
+        # A later teardown of the old match must NOT touch the shared message.
+        conf_msg.edit.reset_mock()
+        await cancel_orphaned_confirmation(bot, db, old, reason="torn down")
+        conf_msg.edit.assert_not_awaited()
+
+    async def test_accepted_carry_without_event_is_safe_noop(self, db):
+        """Accepted carry where the replacement has no TeamUp event must not
+        crash and must still return the carried note."""
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db, home="A", away="B")
+        ts = db.get_match(old)["match_time"]
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=ts, posted_at=1)
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(old)
+        db.set_allocation_assignments(old, ra, {}, None, None)
+        db.set_allocation_status(old, "accepted")
+        teamup = MagicMock()
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=None)
+        bot.get_teamup = MagicMock(return_value=teamup)
+
+        note = await carry_over_if_same_time(bot, db, old, new)
+
+        assert note is not None
+        teamup.update_event.assert_not_called()
