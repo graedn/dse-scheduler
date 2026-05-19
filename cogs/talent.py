@@ -816,6 +816,12 @@ async def carry_over_if_same_time(bot, db, old_match_id: int,
                     log.warning("carry_over: TeamUp accepted move failed "
                                 "for match %s: %s", new_match_id, e)
 
+        # The live confirmation message now belongs to the replacement match.
+        # Drop the old match's pointer so a later teardown of it
+        # (cancel_orphaned_confirmation / _unschedule_match) does not clobber
+        # the shared message and strip its Ready/Reject buttons.
+        db.clear_confirmation_message(old_match_id)
+
         return "Crew + confirmations carried over (same time slot)."
 
     return "Sign-ups carried over (same time slot)."

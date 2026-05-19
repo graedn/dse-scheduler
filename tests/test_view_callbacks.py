@@ -1536,6 +1536,42 @@ class TestCarryOverIfSameTime:
 
         teamup.update_event.assert_not_called()
 
+    async def test_carry_clears_old_confirmation_pointer_so_teardown_no_ops(self, db):
+        """Regression: after an awaiting/accepted carry, the OLD match's
+        confirmation_message_id is cleared so a subsequent
+        cancel_orphaned_confirmation(old) is a no-op and does NOT clobber the
+        shared live confirmation message (Ready/Reject must stay usable)."""
+        from cogs.talent import carry_over_if_same_time
+        from cogs.confirm_view import cancel_orphaned_confirmation
+        old = _insert_match(db, home="A", away="B")
+        ts = db.get_match(old)["match_time"]
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=ts, posted_at=1)
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(old)
+        db.set_allocation_assignments(old, ra, {"1": None, "2": None, "3": None},
+                                      "9001", "900")  # status -> awaiting_confirm
+
+        conf_msg = AsyncMock()
+        conf_msg.content = "ORIGINAL"
+        conf_msg.edit = AsyncMock()
+        channel = AsyncMock()
+        channel.fetch_message = AsyncMock(return_value=conf_msg)
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=channel)
+
+        await carry_over_if_same_time(bot, db, old, new)
+
+        # Ownership moved to the replacement; old pointer cleared.
+        assert db.get_allocation(old)["confirmation_message_id"] is None
+        assert db.get_allocation(new)["confirmation_message_id"] == "9001"
+
+        # A later teardown of the old match must NOT touch the shared message.
+        conf_msg.edit.reset_mock()
+        await cancel_orphaned_confirmation(bot, db, old, reason="torn down")
+        conf_msg.edit.assert_not_awaited()
+
     async def test_accepted_carry_without_event_is_safe_noop(self, db):
         """Accepted carry where the replacement has no TeamUp event must not
         crash and must still return the carried note."""

@@ -520,6 +520,28 @@ def test_update_allocation_lineup_preserves_status_and_message(db):
     assert a["confirmation_channel_id"] == "cch"
 
 
+def test_clear_confirmation_message_nulls_only_pointer(db):
+    mid = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
+                          match_time=1000, posted_at=900)
+    db.create_allocation(mid)
+    db.set_allocation_assignments(
+        mid, {"producer": {"user_id": "u1", "username": "x", "display_name": "U1"}},
+        {"u1": True}, "cmsg", "cch")
+    db.set_allocation_status(mid, "accepted")
+
+    db.clear_confirmation_message(mid)
+
+    a = db.get_allocation(mid)
+    import json
+    assert a["confirmation_message_id"] is None
+    assert a["confirmation_channel_id"] is None
+    # everything else intact
+    assert a["status"] == "accepted"
+    assert json.loads(a["role_assignments"]) == {
+        "producer": {"user_id": "u1", "username": "x", "display_name": "U1"}}
+    assert json.loads(a["confirmations"]) == {"u1": True}
+
+
 def test_copy_allocation_copies_row_verbatim(db):
     old = db.insert_match(division="D1", week="W1", team_home="A", team_away="B",
                           match_time=1000, posted_at=900)

@@ -791,6 +791,19 @@ class Database:
         )
         self.conn.commit()
 
+    def clear_confirmation_message(self, match_id: int) -> None:
+        """Null out only the confirmation message/channel pointer, leaving
+        role_assignments/confirmations/status intact. Used after a same-time
+        carry-over hands the live confirmation message to the replacement
+        match, so a subsequent teardown of the old match does not clobber
+        the now-shared message."""
+        self.conn.execute(
+            "UPDATE talent_allocations SET confirmation_message_id = NULL, "
+            "confirmation_channel_id = NULL, updated_at = ? WHERE match_id = ?",
+            (int(time.time()), match_id)
+        )
+        self.conn.commit()
+
     def set_confirmation(self, match_id: int, user_id: str, confirmed: bool) -> None:
         row = self.conn.execute(
             "SELECT confirmations FROM talent_allocations WHERE match_id = ?",
