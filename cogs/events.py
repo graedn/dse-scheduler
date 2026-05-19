@@ -218,6 +218,14 @@ class EventsCog(commands.Cog):
                 new_match = self.db.get_match_by_teams_in_week(
                     parsed.team_home, parsed.team_away, week_start, week_end)
                 if new_match:
+                    # Transfer the scheduled TeamUp event to the new matchup
+                    # BEFORE carry_over (so an accepted carry can retitle/move
+                    # it to the Accepted sub-calendar) and BEFORE the twin is
+                    # cascade-deleted (so the event is not orphaned).
+                    if twin.get("teamup_event_id"):
+                        self.db.update_match_teamup_id(
+                            new_match["id"], twin["teamup_event_id"])
+                        self.db.update_match_teamup_id(twin["id"], None)
                     from cogs.talent import carry_over_if_same_time
                     await carry_over_if_same_time(
                         self.bot, self.db, twin["id"], new_match["id"])

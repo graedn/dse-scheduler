@@ -540,6 +540,75 @@ async def test_same_time_opponent_swap_carries_over(db):
     assert db.get_match(old_id) is None
 
 
+async def test_same_time_opponent_swap_accepted_keeps_teamup_event(db):
+    """An ACCEPTED scheduled match swapped to a same-time opponent via a
+    post edit must transfer its TeamUp event to the new matchup (no orphan)
+    and move that event to the Accepted sub-calendar with the new teams."""
+    import json
+    from unittest.mock import patch
+
+    ts = WEEK_WED_TS
+    ws, we = _week_bounds(ts)
+
+    old_id = db.insert_match("Premier", "1", "A", "B", ts, ts - 100)
+    db.update_match_teamup_id(old_id, "evtOLD")
+    db.upsert_signup(old_id, "m", "producer", "u1", "user1", "U1")
+    ra = {
+        "producer": {"user_id": "1", "username": "u1", "display_name": "U1"},
+        "observer": {"user_id": "1", "username": "u1", "display_name": "U1"},
+        "pbp_1":    {"user_id": "2", "username": "u2", "display_name": "U2"},
+        "colour_1": {"user_id": "3", "username": "u3", "display_name": "U3"},
+    }
+    db.create_allocation(old_id)
+    db.set_allocation_assignments(old_id, ra, {}, None, None)
+    db.set_allocation_status(old_id, "accepted")
+
+    edited_msg = _make_message(
+        f"Division: Premier\nWeek: 1\nC vs D\nTime: <t:{ts}:F>"
+    )
+    edited_msg.author.bot = False
+
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=edited_msg)
+    log_ch = AsyncMock()
+    teamup = MagicMock()
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+    bot.get_teamup = MagicMock(return_value=teamup)
+
+    def _get_channel(ch_id):
+        if str(ch_id) == "123":
+            return ch
+        if str(ch_id) == "456":
+            return log_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    cog = EventsCog(bot, db, get_teamup=lambda: teamup)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    with patch.object(cog, "_handle_reschedule", new=AsyncMock()):
+        await cog.on_raw_message_edit(payload)
+
+    new = db.get_match_by_teams_in_week("C", "D", ws, we)
+    assert new is not None
+    # TeamUp event ownership transferred to the new matchup (not orphaned).
+    assert db.get_match(new["id"])["teamup_event_id"] == "evtOLD"
+    assert db.get_match(old_id) is None
+    # carry_over moved the accepted event to the Accepted sub-calendar with
+    # the new teams.
+    teamup.update_event.assert_called_once()
+    args, kwargs = teamup.update_event.call_args
+    assert args[0] == "evtOLD"
+    assert "C vs D" in args[1]
+    assert kwargs.get("subcalendar") == "accepted"
+    # The old event was NOT deleted (reused, not orphaned).
+    teamup.delete_event.assert_not_called()
+
+
 # --- _handle_reschedule: state-based logic ---
 
 async def test_handle_reschedule_clears_proposal_slot(db):
