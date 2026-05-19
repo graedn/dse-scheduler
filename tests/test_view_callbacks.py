@@ -1486,3 +1486,75 @@ class TestCarryOverIfSameTime:
         note = await carry_over_if_same_time(bot, db, old, new)
         assert note is None
         assert db.get_signups_for_match(new) == []
+
+    async def test_accepted_carry_moves_teamup_event_to_accepted(self, db):
+        """An accepted carry must move the replacement's TeamUp event to the
+        Accepted sub-calendar with the new teams' title (spec Component 1)."""
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db, home="A", away="B")
+        ts = db.get_match(old)["match_time"]
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=ts, posted_at=1)
+        db.update_match_teamup_id(new, "evtNEW")
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(old)
+        db.set_allocation_assignments(old, ra, {}, None, None)
+        db.set_allocation_status(old, "accepted")
+        teamup = MagicMock()
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=None)
+        bot.get_teamup = MagicMock(return_value=teamup)
+
+        await carry_over_if_same_time(bot, db, old, new)
+
+        teamup.update_event.assert_called_once()
+        args, kwargs = teamup.update_event.call_args
+        assert args[0] == "evtNEW"
+        assert "C vs D" in args[1]
+        assert kwargs.get("subcalendar") == "accepted"
+
+    async def test_awaiting_confirm_carry_does_not_move_teamup_event(self, db):
+        """awaiting_confirm (not yet finalized) must NOT move the event to
+        Accepted — it stays on Proposed until real finalize."""
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db, home="A", away="B")
+        ts = db.get_match(old)["match_time"]
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=ts, posted_at=1)
+        db.update_match_teamup_id(new, "evtNEW")
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(old)
+        db.set_allocation_assignments(old, ra, {}, None, None)  # → awaiting_confirm
+        teamup = MagicMock()
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=None)
+        bot.get_teamup = MagicMock(return_value=teamup)
+
+        await carry_over_if_same_time(bot, db, old, new)
+
+        teamup.update_event.assert_not_called()
+
+    async def test_accepted_carry_without_event_is_safe_noop(self, db):
+        """Accepted carry where the replacement has no TeamUp event must not
+        crash and must still return the carried note."""
+        from cogs.talent import carry_over_if_same_time
+        old = _insert_match(db, home="A", away="B")
+        ts = db.get_match(old)["match_time"]
+        new = db.insert_match(division="Premier", week="Week 1",
+                              team_home="C", team_away="D",
+                              match_time=ts, posted_at=1)
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(old)
+        db.set_allocation_assignments(old, ra, {}, None, None)
+        db.set_allocation_status(old, "accepted")
+        teamup = MagicMock()
+        bot = MagicMock(); bot.db = db
+        bot.get_channel = MagicMock(return_value=None)
+        bot.get_teamup = MagicMock(return_value=teamup)
+
+        note = await carry_over_if_same_time(bot, db, old, new)
+
+        assert note is not None
+        teamup.update_event.assert_not_called()

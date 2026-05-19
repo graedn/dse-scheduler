@@ -790,6 +790,31 @@ async def carry_over_if_same_time(bot, db, old_match_id: int,
             except Exception as e:
                 log.warning("carry_over: notice failed for match %s: %s",
                             new_match_id, e)
+
+        # An accepted broadcast must stay on the Accepted sub-calendar with the
+        # new teams. The replacement's event was created on "proposed" by
+        # accept_combination — move/retitle it to match the finalized state.
+        if status == "accepted":
+            teamup = bot.get_teamup()
+            fresh_new = db.get_match(new_match_id) or new
+            event_id = fresh_new.get("teamup_event_id")
+            if teamup and event_id:
+                from scheduler import match_end_ts
+                title = (
+                    f"[{fresh_new['division']}] {fresh_new['team_home']} vs "
+                    f"{fresh_new['team_away']} {{{fresh_new['id']}}}"
+                )
+                try:
+                    teamup.update_event(
+                        event_id, title, fresh_new["match_time"],
+                        match_end_ts(fresh_new["match_time"]),
+                        subcalendar="accepted",
+                        description=build_talent_description_from_assignments(ra),
+                    )
+                except Exception as e:
+                    log.warning("carry_over: TeamUp accepted move failed "
+                                "for match %s: %s", new_match_id, e)
+
         return "Crew + confirmations carried over (same time slot)."
 
     return "Sign-ups carried over (same time slot)."
