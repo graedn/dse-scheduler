@@ -337,6 +337,14 @@ class _NewMatchSelect(discord.ui.Select):
                                 seen.add(uid)
                                 allocated_talent.append(assignment)
 
+        # Same-time swap → carry silently, do NOT cancel or re-ping talent.
+        if current_match["match_time"] == selected_match["match_time"]:
+            await self._carry_same_time_swap(
+                interaction, db, teamup, current_match, selected_match,
+                selected_match_id, was_accepted,
+            )
+            return
+
         # Remove current match from calendar
         old_event_id = current_match.get("teamup_event_id")
         if teamup and old_event_id:
@@ -428,18 +436,6 @@ class _NewMatchSelect(discord.ui.Select):
             )
             return
 
-        # If the replacement shares the current match's time slot, carry over
-        # sign-ups (and allocation/confirmations when still present) so talent
-        # are not re-pinged. Must run after the replacement is scheduled and
-        # while the source sign-ups still exist.
-        try:
-            from cogs.talent import carry_over_if_same_time
-            await carry_over_if_same_time(
-                interaction.client, db, self.current_match_id, selected_match_id)
-        except Exception as e:
-            log.warning("New Match: carry-over failed (%s → %s): %s",
-                        self.current_match_id, selected_match_id, e)
-
         # Send a ping to allocated talent when an accepted match is replaced
         if was_accepted and allocated_talent and signup_ch:
             mentions = " ".join(f"<@{a['user_id']}>" for a in allocated_talent)
@@ -462,6 +458,104 @@ class _NewMatchSelect(discord.ui.Select):
                 f"✅ **[{selected_match['division']}] "
                 f"{selected_match['team_home']} vs {selected_match['team_away']}** "
                 f"added to the broadcast schedule."
+            ),
+            view=None,
+        )
+
+    async def _carry_same_time_swap(self, interaction, db, teamup,
+                                    current_match, selected_match,
+                                    selected_match_id, was_accepted) -> None:
+        """Replacement shares the current match's time slot: carry sign-ups,
+        allocation and confirmations over, keep the broadcast APPROVED, and do
+        NOT re-ping talent (carry_over_if_same_time edits the existing
+        confirmation message in place and posts the single notice)."""
+        signup_ch = _get_effective_signup_ch(db, interaction.client)
+        date_str = datetime.fromtimestamp(
+            selected_match["match_time"], tz=ET
+        ).strftime("%Y-%m-%d")
+        old_event_id = current_match.get("teamup_event_id")
+
+        from scheduler import accept_combination
+        try:
+            await accept_combination(
+                [selected_match], date_str, db, teamup, signup_ch)
+        except Exception as e:
+            log.error("New Match: accept_combination failed for match %s: %s",
+                      selected_match_id, e)
+            await interaction.response.edit_message(
+                content=f"❌ Failed to schedule replacement: `{e}`", view=None
+            )
+            return
+
+        try:
+            from cogs.talent import carry_over_if_same_time
+            await carry_over_if_same_time(
+                interaction.client, db, self.current_match_id, selected_match_id)
+        except Exception as e:
+            log.warning("New Match: carry-over failed (%s → %s): %s",
+                        self.current_match_id, selected_match_id, e)
+
+        if was_accepted:
+            db.mark_broadcast_accepted(selected_match_id)
+            try:
+                from scheduler import build_approved_signup_message
+                fresh_sel = db.get_match(selected_match_id)
+                sel_alloc = db.get_allocation(selected_match_id)
+                ra = (json.loads(sel_alloc["role_assignments"])
+                      if sel_alloc and sel_alloc.get("role_assignments") else {})
+                sel_bm = db.get_broadcast_message(selected_match_id)
+                if sel_bm and signup_ch:
+                    sel_msg = await signup_ch.fetch_message(
+                        int(sel_bm["discord_message_id"]))
+                    await sel_msg.edit(
+                        content=build_approved_signup_message(fresh_sel, ra),
+                        view=ApprovedSignUpView(selected_match_id),
+                    )
+            except Exception as e:
+                log.warning("New Match: failed to set replacement sign-up "
+                            "to APPROVED: %s", e)
+
+        # Retire the OLD match without cancelling or re-pinging anyone.
+        if teamup and old_event_id:
+            try:
+                teamup.delete_event(old_event_id)
+            except Exception as e:
+                log.warning("New Match: failed to delete event %s: %s",
+                            old_event_id, e)
+        if old_event_id:
+            db.update_match_teamup_id(self.current_match_id, None)
+            db.decrement_scheduled_count(current_match["team_home"])
+            db.decrement_scheduled_count(current_match["team_away"])
+        db.reset_allocation(self.current_match_id)
+        if was_accepted:
+            db.clear_broadcast_accepted(self.current_match_id)
+
+        old_bm = db.get_broadcast_message(self.current_match_id)
+        if old_bm and signup_ch:
+            try:
+                old_msg = await signup_ch.fetch_message(
+                    int(old_bm["discord_message_id"]))
+                ts = current_match["match_time"]
+                await old_msg.edit(
+                    content=(
+                        f"{_SEPARATOR}\n"
+                        f"📋 [{current_match['division']}] "
+                        f"{current_match['team_home']} vs {current_match['team_away']}\n"
+                        f"<t:{ts}:F>\n\n"
+                        f"♻️ This broadcast now covers a different match at the "
+                        f"same time — see the updated post."
+                    ),
+                    view=discord.ui.View(),
+                )
+            except Exception as e:
+                log.warning("New Match: failed to edit old sign-up message: %s", e)
+
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **[{selected_match['division']}] "
+                f"{selected_match['team_home']} vs {selected_match['team_away']}** "
+                f"carried over to the broadcast schedule "
+                f"(same time — talent not re-pinged)."
             ),
             view=None,
         )

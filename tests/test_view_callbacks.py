@@ -1144,7 +1144,8 @@ class TestNewMatchSelect:
 
 
 # ===========================================================================
-# Task 13 — New Match button carries over state when the time is unchanged
+# Task 13b — New Match same-time swap carries over silently (no re-ping);
+#            different-time swap unchanged (still cancels + re-pings).
 # ===========================================================================
 
 class TestNewMatchCarryOver:
@@ -1156,25 +1157,126 @@ class TestNewMatchCarryOver:
         """discord.ui.Select.values is read-only; set the internal _values attribute."""
         select._values = values
 
-    async def test_same_time_swap_carries_signups_to_replacement(self, db):
-        # Current and replacement share the SAME match_time
+    async def test_same_time_accepted_swap_carries_without_reping(self, db):
+        # `cur` is an ACCEPTED broadcast; `repl` shares the SAME match_time.
         cur = _insert_match(db, TS_8PM, home="Team A", away="Team B")
         repl = _insert_match(db, TS_8PM, home="Team C", away="Team D")
-        db.update_match_teamup_id(cur, "evt_cur")
+        db.update_match_teamup_id(cur, "evtC")
+        db.set_config("signup_channel_id", "99")
+        db.set_config("schedule_updates_channel_id", "77")
+
+        ra = _role_assignments("1", "2", "3")
+        _setup_allocation(db, cur, ra, status="accepted",
+                          conf_msg_id="CM1", conf_ch_id="888")
+        db.set_confirmation(cur, "1", True)
+        db.set_confirmation(cur, "2", True)
+        db.set_confirmation(cur, "3", True)
+        db.mark_broadcast_accepted(cur)
+        db.upsert_signup(cur, "m", "producer", "u1", "user1", "U1")
+
+        select = self._select(cur, [db.get_match(repl)], db)
+        self._set_values(select, [str(repl)])
+
+        signup_ch = AsyncMock()
+        interaction = _make_interaction(db, user_id="1")
+        interaction.client.get_teamup.return_value = MagicMock()
+        interaction.client.get_channel.return_value = signup_ch
+
+        with patch("scheduler.accept_combination", new_callable=AsyncMock):
+            await select.callback(interaction)
+
+        # (a) sign-ups carried over to the replacement
+        assert "u1" in {s["user_id"] for s in db.get_signups_for_match(repl)}
+        # (b) allocation carried over with role assignments + status accepted
+        repl_alloc = db.get_allocation(repl)
+        assert repl_alloc is not None
+        assert repl_alloc["role_assignments"] not in (None, "", "{}")
+        assert repl_alloc["status"] == "accepted"
+        # (c) NO talent re-ping was sent (no channel send with replaced + mention)
+        all_sends = (
+            [str(c) for c in signup_ch.send.call_args_list]
+            + [str(c) for c in interaction.client.get_channel.return_value.send.call_args_list]
+        )
+        reping_calls = [s for s in all_sends if "replaced" in s and "<@" in s]
+        assert reping_calls == []
+        # (d) replacement remains an accepted broadcast
+        assert db.get_match(repl)["broadcast_accepted"] == 1
+
+    async def test_different_time_swap_unchanged_still_cancels_and_pings(self, db):
+        # `cur` accepted; `repl` at a DIFFERENT match_time -> old behaviour.
+        cur = _insert_match(db, TS_8PM, home="Team A", away="Team B")
+        repl = _insert_match(db, TS_10PM, home="Team C", away="Team D")
+        db.update_match_teamup_id(cur, "evtAcc")
+        db.set_config("signup_channel_id", "99")
+
+        ra = _role_assignments("1", "2", "3")
+        db.create_allocation(cur)
+        db.set_allocation_assignments(cur, ra, {}, None, None)
+        db.set_allocation_status(cur, "accepted")
+        db.mark_broadcast_accepted(cur)
+
+        signup_ch = AsyncMock()
+        select = self._select(cur, [db.get_match(repl)], db)
+        self._set_values(select, [str(repl)])
+
+        interaction = _make_interaction(db, user_id="1")
+        interaction.client.get_teamup.return_value = MagicMock()
+        interaction.client.get_channel.return_value = signup_ch
+
+        with patch("scheduler.accept_combination", new_callable=AsyncMock):
+            await select.callback(interaction)
+
+        # No carry-over for a different-time swap
+        assert db.get_signups_for_match(repl) == []
+        # Allocated-talent re-ping WAS sent (mentions + replaced notice)
+        ping_calls = [c for c in signup_ch.send.call_args_list
+                      if "<@" in str(c) and "replaced" in str(c)]
+        assert len(ping_calls) >= 1
+        # Old allocation reset (role_assignments nulled)
+        old_alloc = db.get_allocation(cur)
+        assert old_alloc is None or old_alloc["role_assignments"] in (None, "", "{}")
+
+    async def test_same_time_signup_stage_swap_carries_signups_no_cancel(self, db):
+        # `cur` NOT accepted (sign-up stage), has teamup event + a sign-up,
+        # no confirmations; `repl` at the SAME time.
+        cur = _insert_match(db, TS_8PM, home="Team A", away="Team B")
+        repl = _insert_match(db, TS_8PM, home="Team C", away="Team D")
+        db.update_match_teamup_id(cur, "evtS")
         db.set_config("signup_channel_id", "99")
         db.upsert_signup(cur, "m", "producer", "u1", "user1", "U1")
+
+        # An original sign-up message exists for `cur` so we can inspect its edit.
+        db.insert_broadcast_message(cur, "5555", "99")
+
+        edited = {}
+        old_msg = AsyncMock()
+
+        async def _edit(**kwargs):
+            edited["content"] = kwargs.get("content")
+            edited["view"] = kwargs.get("view")
+        old_msg.edit = _edit
+
+        signup_ch = AsyncMock()
+        signup_ch.fetch_message = AsyncMock(return_value=old_msg)
 
         select = self._select(cur, [db.get_match(repl)], db)
         self._set_values(select, [str(repl)])
 
         interaction = _make_interaction(db, user_id="1")
         interaction.client.get_teamup.return_value = MagicMock()
-        interaction.client.get_channel.return_value = AsyncMock()
+        interaction.client.get_channel.return_value = signup_ch
 
         with patch("scheduler.accept_combination", new_callable=AsyncMock):
             await select.callback(interaction)
 
-        assert {s["user_id"] for s in db.get_signups_for_match(repl)} == {"u1"}
+        # Sign-up carried to replacement
+        assert "u1" in {s["user_id"] for s in db.get_signups_for_match(repl)}
+        # Old sign-up message edited to the neutral moved notice
+        assert edited.get("content") is not None
+        assert "♻️" in edited["content"]
+        assert "different match at the same time" in edited["content"]
+        assert "CANCELLED" not in edited["content"]
+        assert "<@" not in edited["content"]
 
 
 # ===========================================================================
