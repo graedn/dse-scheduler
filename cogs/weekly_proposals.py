@@ -236,6 +236,29 @@ async def create_weekly_proposals(bot, db, start_date=None) -> None:
             log.error("Failed to post proposal message for %s: %s", date_str, e)
 
 
+async def recover_missed_weekly_proposals(bot, db) -> None:
+    """Startup catch-up for a missed Sunday 23:00 ET creation.
+
+    APScheduler does not run a cron job whose fire time elapsed while the
+    process was down, so if the bot was offline at the Sunday transition the
+    current week's proposal messages are never created. When no proposal rows
+    exist for the current week, create them now (today through this Sunday).
+    Idempotent: a no-op when the week's proposals already exist (normal
+    restart) and it never pre-empts the still-scheduled Sunday job that
+    creates the *next* week.
+    """
+    today = datetime.now(tz=ET).date()
+    monday = today - timedelta(days=today.weekday())
+    week_start = monday.isoformat()
+    if db.get_proposal_messages_for_week(week_start):
+        return  # week already has proposals — nothing was missed
+    log.info(
+        "Weekly proposals missing for week %s — running startup recovery.",
+        week_start,
+    )
+    await create_weekly_proposals(bot, db, start_date=today)
+
+
 async def mark_passed_proposals(db, bot) -> None:
     """Mark proposals whose dates have passed, and remove their buttons."""
     today = datetime.now(tz=ET).date()
