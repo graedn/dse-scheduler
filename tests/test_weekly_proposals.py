@@ -221,6 +221,54 @@ def test_match_option_label_has_emoji_priority():
 
 
 # ---------------------------------------------------------------------------
+# recover_missed_weekly_proposals (startup catch-up)
+# ---------------------------------------------------------------------------
+
+async def test_recover_missed_weekly_proposals_creates_when_week_empty(db):
+    """Bot offline at the Sunday transition → current week has no proposal
+    rows → startup recovery creates them (today through this Sunday)."""
+    from cogs.weekly_proposals import recover_missed_weekly_proposals
+
+    today = datetime.now(ET).date()
+    week_start = (today - timedelta(days=today.weekday())).isoformat()
+    assert db.get_proposal_messages_for_week(week_start) == []  # nothing yet
+
+    db.set_config("proposal_channel_id", "555")
+    channel = AsyncMock()
+    channel.id = 555
+    channel.send = AsyncMock(return_value=MagicMock(id=999))
+    bot = MagicMock()
+    bot.get_channel = MagicMock(return_value=channel)
+
+    await recover_missed_weekly_proposals(bot, db)
+
+    rows = db.get_proposal_messages_for_week(week_start)
+    assert rows  # current week's proposals were created
+    assert channel.send.await_count >= 1
+
+
+async def test_recover_missed_weekly_proposals_noop_when_week_present(db, monkeypatch):
+    """Normal restart → current week already has proposal rows → recovery is
+    a no-op and does NOT re-run create_weekly_proposals."""
+    import cogs.weekly_proposals as wp
+    from cogs.weekly_proposals import recover_missed_weekly_proposals
+
+    today = datetime.now(ET).date()
+    week_start = (today - timedelta(days=today.weekday())).isoformat()
+    day_ts = int(datetime(today.year, today.month, today.day, tzinfo=ET).timestamp())
+    db.create_proposal_message(today.isoformat(), day_ts, week_start)
+    assert db.get_proposal_messages_for_week(week_start)  # row exists
+
+    called = AsyncMock()
+    monkeypatch.setattr(wp, "create_weekly_proposals", called)
+    bot = MagicMock()
+
+    await recover_missed_weekly_proposals(bot, db)
+
+    called.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # mark_passed_proposals
 # ---------------------------------------------------------------------------
 
