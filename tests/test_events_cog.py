@@ -483,6 +483,63 @@ async def test_on_raw_message_edit_same_time_is_noop(db):
     assert db.get_match(old_id) is not None  # unchanged
 
 
+async def test_same_time_opponent_swap_carries_over(db):
+    """Editing a post to a different matchup at the SAME time as an existing
+    SCHEDULED match is treated as a same-slot opponent swap: the new matchup is
+    inserted, sign-ups carry over, and the old scheduled match is torn down."""
+    from unittest.mock import patch
+
+    ts = WEEK_WED_TS  # in the future, in a Mon–Sun ET week
+    ws, we = _week_bounds(ts)
+
+    # Scheduled match A vs B at ts, with a TeamUp event and a sign-up.
+    old_id = db.insert_match("Premier", "1", "A", "B", ts, ts - 100)
+    db.update_match_teamup_id(old_id, "evtOLD")
+    db.upsert_signup(old_id, "m", "producer", "u1", "user1", "U1")
+
+    # Edited post parses to a DIFFERENT matchup (C vs D) at the SAME ts.
+    edited_msg = _make_message(
+        f"Division: Premier\nWeek: 1\nC vs D\nTime: <t:{ts}:F>"
+    )
+    edited_msg.author.bot = False
+
+    ch = AsyncMock()
+    ch.fetch_message = AsyncMock(return_value=edited_msg)
+    log_ch = AsyncMock()
+
+    bot = MagicMock()
+    bot.dispatch = MagicMock()
+
+    def _get_channel(ch_id):
+        if str(ch_id) == "123":
+            return ch
+        if str(ch_id) == "456":
+            return log_ch
+        return None
+
+    bot.get_channel.side_effect = _get_channel
+    db.set_config("match_channel_id", "123")
+    db.set_config("log_channel_id", "456")
+    cog = EventsCog(bot, db, get_teamup=lambda: None)
+
+    payload = _make_raw_edit_payload(message_id=999, channel_id=123)
+    with patch.object(cog, "_handle_reschedule", new=AsyncMock()) as handle_resched:
+        await cog.on_raw_message_edit(payload)
+
+    # _handle_reschedule must NOT have run — this is the new same-time-swap branch.
+    handle_resched.assert_not_called()
+
+    # New matchup C vs D exists at ts with the sign-up carried over.
+    new = db.get_match_by_teams_in_week("C", "D", ws, we)
+    assert new is not None
+    assert new["match_time"] == ts
+    assert {s["user_id"] for s in db.get_signups_for_match(new["id"])} == {"u1"}
+
+    # Old A-vs-B scheduled match was torn down.
+    assert db.get_match_by_teams_in_week("A", "B", ws, we) is None
+    assert db.get_match(old_id) is None
+
+
 # --- _handle_reschedule: state-based logic ---
 
 async def test_handle_reschedule_clears_proposal_slot(db):

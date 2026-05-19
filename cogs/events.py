@@ -202,21 +202,50 @@ class EventsCog(commands.Cog):
         )
 
         if not old_match:
-            if not self.db.match_exists(parsed.team_home, parsed.team_away, parsed.match_time):
+            twin = self.db.get_scheduled_match_at_time_in_week(
+                parsed.match_time, week_start, week_end
+            )
+            if twin and not (twin["team_home"] == parsed.team_home
+                             and twin["team_away"] == parsed.team_away):
+                if not self.db.match_exists(parsed.team_home, parsed.team_away,
+                                            parsed.match_time):
+                    self.db.insert_match(
+                        division=parsed.division, week=parsed.week,
+                        team_home=parsed.team_home, team_away=parsed.team_away,
+                        match_time=parsed.match_time,
+                        posted_at=int(message.created_at.timestamp()),
+                    )
+                new_match = self.db.get_match_by_teams_in_week(
+                    parsed.team_home, parsed.team_away, week_start, week_end)
+                if new_match:
+                    from cogs.talent import carry_over_if_same_time
+                    await carry_over_if_same_time(
+                        self.bot, self.db, twin["id"], new_match["id"])
+                    from cogs.confirm_view import cancel_orphaned_confirmation
+                    await cancel_orphaned_confirmation(
+                        self.bot, self.db, twin["id"],
+                        reason="this slot's opponent changed (same time)")
+                    self.db.clear_match_from_proposal_slots(twin["id"])
+                    self.db.delete_match_cascade(twin["id"])
+                    md = datetime.fromtimestamp(
+                        parsed.match_time, tz=ET).strftime("%Y-%m-%d")
+                    self.bot.dispatch("match_logged", md)
+                return
+            if not self.db.match_exists(parsed.team_home, parsed.team_away,
+                                        parsed.match_time):
                 self.db.insert_match(
-                    division=parsed.division,
-                    week=parsed.week,
-                    team_home=parsed.team_home,
-                    team_away=parsed.team_away,
+                    division=parsed.division, week=parsed.week,
+                    team_home=parsed.team_home, team_away=parsed.team_away,
                     match_time=parsed.match_time,
                     posted_at=int(message.created_at.timestamp()),
                 )
-                match_date = datetime.fromtimestamp(parsed.match_time, tz=ET).strftime("%Y-%m-%d")
+                match_date = datetime.fromtimestamp(
+                    parsed.match_time, tz=ET).strftime("%Y-%m-%d")
                 self.bot.dispatch("match_logged", match_date)
             return
 
         if old_match["match_time"] == parsed.match_time:
-            return  # no-op — same time
+            return  # no-op — same time, same teams
 
         await self._handle_reschedule(old_match, parsed)
 
