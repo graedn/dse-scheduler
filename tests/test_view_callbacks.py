@@ -1144,6 +1144,40 @@ class TestNewMatchSelect:
 
 
 # ===========================================================================
+# Task 13 — New Match button carries over state when the time is unchanged
+# ===========================================================================
+
+class TestNewMatchCarryOver:
+    def _select(self, current_match_id, replacements, db):
+        from cogs.signup import _NewMatchSelect
+        return _NewMatchSelect(current_match_id, replacements, db)
+
+    def _set_values(self, select, values):
+        """discord.ui.Select.values is read-only; set the internal _values attribute."""
+        select._values = values
+
+    async def test_same_time_swap_carries_signups_to_replacement(self, db):
+        # Current and replacement share the SAME match_time
+        cur = _insert_match(db, TS_8PM, home="Team A", away="Team B")
+        repl = _insert_match(db, TS_8PM, home="Team C", away="Team D")
+        db.update_match_teamup_id(cur, "evt_cur")
+        db.set_config("signup_channel_id", "99")
+        db.upsert_signup(cur, "m", "producer", "u1", "user1", "U1")
+
+        select = self._select(cur, [db.get_match(repl)], db)
+        self._set_values(select, [str(repl)])
+
+        interaction = _make_interaction(db, user_id="1")
+        interaction.client.get_teamup.return_value = MagicMock()
+        interaction.client.get_channel.return_value = AsyncMock()
+
+        with patch("scheduler.accept_combination", new_callable=AsyncMock):
+            await select.callback(interaction)
+
+        assert {s["user_id"] for s in db.get_signups_for_match(repl)} == {"u1"}
+
+
+# ===========================================================================
 # Optional roles tracked in confirmations but never gate finalization
 # ===========================================================================
 

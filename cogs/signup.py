@@ -428,6 +428,18 @@ class _NewMatchSelect(discord.ui.Select):
             )
             return
 
+        # If the replacement shares the current match's time slot, carry over
+        # sign-ups (and allocation/confirmations when still present) so talent
+        # are not re-pinged. Must run after the replacement is scheduled and
+        # while the source sign-ups still exist.
+        try:
+            from cogs.talent import carry_over_if_same_time
+            await carry_over_if_same_time(
+                interaction.client, db, self.current_match_id, selected_match_id)
+        except Exception as e:
+            log.warning("New Match: carry-over failed (%s → %s): %s",
+                        self.current_match_id, selected_match_id, e)
+
         # Send a ping to allocated talent when an accepted match is replaced
         if was_accepted and allocated_talent and signup_ch:
             mentions = " ".join(f"<@{a['user_id']}>" for a in allocated_talent)
