@@ -316,6 +316,73 @@ async def test_unblock_day_deletes_teamup_event(db):
 
 
 # ---------------------------------------------------------------------------
+# _UpdateScheduleButton — carry-over when slot swap keeps the same time
+# ---------------------------------------------------------------------------
+
+def _update_interaction(db):
+    """Mock interaction for _UpdateScheduleButton tests (admin user).
+
+    Mirrors _unblock_interaction but adds get_channel and the
+    _proposal_selections cache used to inject the manager's slot choice.
+    """
+    interaction = MagicMock()
+    interaction.guild = MagicMock()
+    interaction.user.guild_permissions.administrator = True
+    interaction.client.db = db
+    interaction.client.get_teamup.return_value = MagicMock()
+    interaction.client.get_channel.return_value = AsyncMock()
+    interaction.client._proposal_selections = {}
+    interaction.response = AsyncMock()
+    interaction.followup = AsyncMock()
+    interaction.message = AsyncMock()
+    return interaction
+
+
+async def test_proposal_swap_same_time_carries_signups(db, monkeypatch):
+    """Swapping the slot-1 match for a different match at the SAME match_time
+    carries the old match's sign-ups onto the new match instead of posting a
+    fresh sign-up for the new match."""
+    from cogs import weekly_proposals
+
+    old = db.insert_match("Premier", "1", "Alpha", "Beta", MATCH_TS, MATCH_TS - 3600)
+    new = db.insert_match("Premier", "1", "Gamma", "Delta", MATCH_TS, MATCH_TS - 3600)
+    db.update_match_teamup_id(old, "evtOLD")
+
+    db.create_proposal_message(DATE_STR, DATE_TS, "2099-06-09")
+    db.update_proposal_slots(DATE_STR, old, None)
+    db.upsert_signup(old, "m", "producer", "u1", "user1", "U1")
+
+    # Patch the heavy collaborators so the test isolates the carry-over wiring.
+    acc = AsyncMock()
+    unsched = AsyncMock()
+    monkeypatch.setattr(weekly_proposals, "accept_combination", acc)
+    monkeypatch.setattr(weekly_proposals, "_unschedule_match", unsched)
+
+    interaction = _update_interaction(db)
+    # Manager selects `new` in slot 1, slot 2 stays empty (same mechanism the
+    # callback reads: interaction.client._proposal_selections keyed by
+    # (date_str, slot); see _UpdateScheduleButton.callback).
+    interaction.client._proposal_selections = {
+        (DATE_STR, 1): str(new),
+        (DATE_STR, 2): "none",
+    }
+
+    button = weekly_proposals._UpdateScheduleButton(DATE_STR)
+    await button.callback(interaction)
+
+    # The old match's sign-up was carried onto the new match.
+    assert {s["user_id"] for s in db.get_signups_for_match(new)} == {"u1"}
+    # The old match was still unscheduled.
+    assert old in {c.args[0] for c in unsched.call_args_list}
+    # accept_combination was used to create the new match's event/allocation
+    # (carry-over path), but NOT a second time via the fresh-path loop —
+    # exactly one call, for `new`, and no fresh duplicate sign-up post.
+    assert acc.await_count == 1
+    called_match_ids = {m["id"] for m in acc.call_args.args[0]}
+    assert called_match_ids == {new}
+
+
+# ---------------------------------------------------------------------------
 # _send_schedule_update_ping
 # ---------------------------------------------------------------------------
 

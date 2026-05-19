@@ -360,12 +360,40 @@ class _UpdateScheduleButton(discord.ui.Button):
         to_add = [mid for mid in [slot1_id, slot2_id]
                   if mid and mid not in set(old_slot_ids)]
 
+        from cogs.talent import carry_over_if_same_time
+
+        # Pair each added match with a removed match at the same time (if any)
+        # so state carries over instead of a fresh sign-up.
+        carried_new_ids: set[int] = set()
+        for new_mid in list(to_add):
+            new_m = db.get_match(new_mid)
+            if not new_m:
+                continue
+            twin = next(
+                (rm for rm in to_remove
+                 if (db.get_match(rm) or {}).get("match_time") == new_m["match_time"]),
+                None,
+            )
+            if twin is not None:
+                try:
+                    await accept_combination(
+                        [new_m], self.date_str, db, teamup, signup_ch,
+                        talent_role_mention="")
+                except Exception as e:
+                    log.error("Update Schedule: accept_combination failed for %s: %s",
+                              new_mid, e)
+                    continue
+                await carry_over_if_same_time(interaction.client, db, twin, new_mid)
+                carried_new_ids.add(new_mid)
+
         for mid in to_remove:
             await _unschedule_match(mid, db, teamup, signup_ch, bot=interaction.client)
 
         talent_role_id = db.get_config("talent_role_id")
         talent_role_mention = f"<@&{talent_role_id}>" if talent_role_id else ""
         for mid in to_add:
+            if mid in carried_new_ids:
+                continue
             m = db.get_match(mid)
             if not m:
                 continue
